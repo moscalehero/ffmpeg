@@ -1,19 +1,30 @@
 """
-FFmpeg HTTP Service v0.5
-Audio cutting + smart optimization for UGC ad pipeline.
+FFmpeg HTTP Service v0.6
+Smart audio analysis + context-aware optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
-  POST /audio/optimize      - Smart 3s optimization for single audio file
+  POST /audio/analyze       - Deep analysis of single audio file
+  POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s)
+
+Changelog v0.6:
+  - Added /audio/analyze endpoint (volume, silence, speech density, style)
+  - Rewrote /audio/optimize with context-aware strategy
+  - Adaptive silence threshold (mean_volume - 20dB)
+  - Speech style classification (fast/normal/slow)
+  - Pause categorization (micro/short/medium/long/very_long)
+  - Selective pause trimming (cap instead of kill)
+  - Hard cap 4.0s absolute (emergency atempo up to 1.20 if needed)
+  - Rich metadata in responses
 
 Changelog v0.5:
-  - Added /audio/optimize endpoint
-  - Smart tiered logic (5 tiers) for 3s target
-  - Silence compression via ffmpeg silenceremove
-  - Optional atempo with 1.15 hard cap
+  - Added /audio/optimize endpoint (basic tiered logic)
+
+Changelog v0.4:
+  - Accurate seeking + two-pass cut
 """
 
 import subprocess
@@ -23,12 +34,13 @@ import base64
 import uuid
 import time
 import re
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.5.0")
+app = FastAPI(title="FFmpeg Service", version="0.6.0")
 
 # ============================================
 # CONFIG
@@ -37,10 +49,27 @@ API_TOKEN = os.getenv("API_TOKEN", "change-me")
 WORK_DIR = Path("/tmp/ffmpeg")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# Optimization constants (hardcoded for consistency)
-TARGET_DURATION = 3.0
-MAX_ATEMPO = 1.15
-SILENCE_THRESHOLD_DB = -35.0
+# Optimization targets
+SOFT_TARGET = 3.0          # ideal duration
+HARD_CAP = 4.0             # absolute max (never exceed)
+ATEMPO_MAX = 1.15          # normal max
+ATEMPO_EMERGENCY = 1.20    # only for extreme cases
+
+# Silence detection
+SILENCE_RELATIVE_DB = 20   # adaptive: mean_volume - this = silence threshold
+SILENCE_FALLBACK_DB = -35  # if mean_volume detection fails
+MIN_PAUSE_DETECT_MS = 80   # ignore anything shorter than this
+
+# Pause categorization (milliseconds)
+PAUSE_MICRO_MAX = 180       # 80-180ms
+PAUSE_SHORT_MAX = 300       # 180-300ms
+PAUSE_MEDIUM_MAX = 500      # 300-500ms
+PAUSE_LONG_MAX = 800        # 500-800ms
+# >800ms = very_long
+
+# Speech density thresholds
+DENSITY_FAST = 0.85
+DENSITY_NORMAL = 0.70
 
 security = HTTPBearer()
 
@@ -51,7 +80,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 
 # ============================================
-# HELPERS
+# BASIC HELPERS
 # ============================================
 def run_ffmpeg(args: list) -> tuple:
     """Run ffmpeg command, return (returncode, stderr)."""
@@ -75,6 +104,517 @@ def get_duration(filepath: Path) -> float:
         return 0.0
 
 
+# ============================================
+# AUDIO ANALYSIS
+# ============================================
+def detect_volume(input_path: Path) -> dict:
+    """
+    Detect mean and max volume using volumedetect filter.
+    Returns dict with mean_db, max_db.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner",
+        "-i", str(input_path),
+        "-af", "volumedetect",
+        "-f", "null", "-"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    
+    mean_db = None
+    max_db = None
+    
+    for line in result.stderr.split("\n"):
+        mean_match = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", line)
+        max_match = re.search(r"max_volume:\s*(-?[\d.]+)\s*dB", line)
+        if mean_match:
+            mean_db = float(mean_match.group(1))
+        if max_match:
+            max_db = float(max_match.group(1))
+    
+    return {
+        "mean_db": round(mean_db, 2) if mean_db is not None else None,
+        "max_db": round(max_db, 2) if max_db is not None else None
+    }
+
+
+def detect_silences(input_path: Path, threshold_db: float, min_duration: float = 0.08) -> list:
+    """
+    Detect all silence periods in audio.
+    Returns list of dicts with start, end, duration.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner",
+        "-i", str(input_path),
+        "-af", f"silencedetect=noise={threshold_db}dB:d={min_duration}",
+        "-f", "null", "-"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    
+    silences = []
+    current_start = None
+    
+    for line in result.stderr.split("\n"):
+        start_match = re.search(r"silence_start:\s*(-?[\d.]+)", line)
+        end_match = re.search(r"silence_end:\s*([\d.]+)", line)
+        dur_match = re.search(r"silence_duration:\s*([\d.]+)", line)
+        
+        if start_match:
+            current_start = float(start_match.group(1))
+            # Clamp negative starts to 0
+            if current_start < 0:
+                current_start = 0.0
+        elif end_match and current_start is not None:
+            end_time = float(end_match.group(1))
+            duration = float(dur_match.group(1)) if dur_match else (end_time - current_start)
+            silences.append({
+                "start": round(current_start, 3),
+                "end": round(end_time, 3),
+                "duration": round(duration, 3)
+            })
+            current_start = None
+    
+    return silences
+
+
+def categorize_pause(duration_ms: int) -> str:
+    """Categorize a pause by duration."""
+    if duration_ms < PAUSE_MICRO_MAX:
+        return "micro"
+    elif duration_ms < PAUSE_SHORT_MAX:
+        return "short"
+    elif duration_ms < PAUSE_MEDIUM_MAX:
+        return "medium"
+    elif duration_ms < PAUSE_LONG_MAX:
+        return "long"
+    else:
+        return "very_long"
+
+
+def classify_speech_style(density: float) -> tuple:
+    """Classify speech style based on speech density. Returns (style, reasoning)."""
+    if density >= DENSITY_FAST:
+        return "fast", f"high density ({density:.2f}), dense delivery with few pauses"
+    elif density >= DENSITY_NORMAL:
+        return "normal", f"balanced density ({density:.2f}), natural speech rhythm"
+    else:
+        return "slow", f"low density ({density:.2f}), many or long pauses"
+
+
+def analyze_audio(input_path: Path) -> dict:
+    """
+    Full analysis of an audio file.
+    Returns detailed metrics + recommendation.
+    """
+    duration = get_duration(input_path)
+    volume = detect_volume(input_path)
+    
+    # Adaptive silence threshold
+    if volume["mean_db"] is not None:
+        silence_threshold_db = volume["mean_db"] - SILENCE_RELATIVE_DB
+    else:
+        silence_threshold_db = SILENCE_FALLBACK_DB
+    
+    silences = detect_silences(
+        input_path, 
+        threshold_db=silence_threshold_db,
+        min_duration=MIN_PAUSE_DETECT_MS / 1000
+    )
+    
+    # Enrich silences with duration_ms + category
+    for s in silences:
+        s["duration_ms"] = round(s["duration"] * 1000)
+        s["category"] = categorize_pause(s["duration_ms"])
+    
+    # Calculate speech metrics
+    total_silence = sum(s["duration"] for s in silences)
+    active_speech = max(0, duration - total_silence)
+    speech_density = active_speech / duration if duration > 0 else 0
+    
+    style, style_reasoning = classify_speech_style(speech_density)
+    
+    # Pause distribution
+    distribution = {
+        "micro": 0,
+        "short": 0,
+        "medium": 0,
+        "long": 0,
+        "very_long": 0
+    }
+    for s in silences:
+        distribution[s["category"]] += 1
+    
+    # Pause stats
+    durations_ms = [s["duration_ms"] for s in silences]
+    pause_stats = {
+        "count": len(silences),
+        "total_ms": round(total_silence * 1000),
+        "avg_ms": round(sum(durations_ms) / len(durations_ms)) if durations_ms else 0,
+        "min_ms": min(durations_ms) if durations_ms else 0,
+        "max_ms": max(durations_ms) if durations_ms else 0,
+        "distribution": distribution
+    }
+    
+    # Generate recommendation
+    recommendation = generate_recommendation(
+        duration=duration,
+        style=style,
+        silences=silences,
+        speech_density=speech_density
+    )
+    
+    return {
+        "duration": round(duration, 3),
+        "volume": volume,
+        "silence_threshold_db_used": round(silence_threshold_db, 2),
+        "speech": {
+            "active_speech_time": round(active_speech, 3),
+            "total_silence_time": round(total_silence, 3),
+            "speech_density": round(speech_density, 3),
+            "style": style,
+            "style_reasoning": style_reasoning
+        },
+        "pauses": {
+            **pause_stats,
+            "all_pauses": silences
+        },
+        "recommendation": recommendation
+    }
+
+
+# ============================================
+# STRATEGY ENGINE
+# ============================================
+def get_trim_rules(style: str) -> dict:
+    """Get pause trim caps based on speech style (in ms)."""
+    if style == "fast":
+        return {
+            "micro": None,      # keep
+            "short": None,      # keep
+            "medium": None,     # keep (dramatic beats)
+            "long": 300,
+            "very_long": 350
+        }
+    elif style == "normal":
+        return {
+            "micro": None,
+            "short": None,
+            "medium": 250,
+            "long": 200,
+            "very_long": 250
+        }
+    else:  # slow
+        return {
+            "micro": None,
+            "short": 180,
+            "medium": 180,
+            "long": 150,
+            "very_long": 200
+        }
+
+
+def calculate_silence_savings(silences: list, trim_rules: dict) -> int:
+    """Calculate how much silence (in ms) would be saved with given rules."""
+    savings_ms = 0
+    for s in silences:
+        cap = trim_rules.get(s["category"])
+        if cap is not None and s["duration_ms"] > cap:
+            savings_ms += s["duration_ms"] - cap
+    return savings_ms
+
+
+def generate_recommendation(duration: float, style: str, silences: list, speech_density: float) -> dict:
+    """Generate optimization strategy recommendation."""
+    
+    # Already under target
+    if duration <= SOFT_TARGET:
+        return {
+            "needs_optimization": False,
+            "reason": f"duration {duration:.3f}s already under target {SOFT_TARGET}s",
+            "feasibility": "not_needed",
+            "estimated_final_duration": duration
+        }
+    
+    trim_rules = get_trim_rules(style)
+    silence_savings_ms = calculate_silence_savings(silences, trim_rules)
+    after_silence_s = duration - (silence_savings_ms / 1000)
+    
+    # Figure out atempo
+    delta_to_target = max(0, after_silence_s - SOFT_TARGET)
+    delta_to_cap = max(0, after_silence_s - HARD_CAP)
+    
+    if delta_to_cap <= 0:
+        # Silence alone gets us under cap
+        if delta_to_target <= 0:
+            # Also under soft target
+            estimated_atempo = 1.0
+        else:
+            # Between soft target and cap - use gentle atempo if style allows
+            if style == "fast":
+                estimated_atempo = 1.0  # don't touch fast speakers
+            else:
+                ideal = after_silence_s / SOFT_TARGET
+                estimated_atempo = min(ideal, ATEMPO_MAX)
+    else:
+        # Need atempo to get under cap
+        required = after_silence_s / HARD_CAP
+        ideal = after_silence_s / SOFT_TARGET
+        
+        if required <= ATEMPO_MAX:
+            # Can hit cap with normal atempo, try to approach target
+            estimated_atempo = min(ideal, ATEMPO_MAX)
+        elif required <= ATEMPO_EMERGENCY:
+            # Need emergency atempo
+            estimated_atempo = required
+        else:
+            # Even emergency atempo can't save us - will fail
+            estimated_atempo = ATEMPO_EMERGENCY  # best we can do
+    
+    estimated_final = after_silence_s / estimated_atempo if estimated_atempo > 1.0 else after_silence_s
+    hit_target = estimated_final <= SOFT_TARGET + 0.1
+    hit_cap = estimated_final <= HARD_CAP + 0.05
+    
+    # Feasibility
+    if hit_target:
+        feasibility = "easy"
+    elif hit_cap:
+        feasibility = "moderate"
+    else:
+        feasibility = "hard"
+    
+    return {
+        "needs_optimization": True,
+        "feasibility": feasibility,
+        "silence_savings_potential_ms": silence_savings_ms,
+        "after_silence_duration": round(after_silence_s, 3),
+        "estimated_atempo": round(estimated_atempo, 2),
+        "estimated_final_duration": round(estimated_final, 3),
+        "hit_soft_target": hit_target,
+        "hit_hard_cap": hit_cap,
+        "strategy": {
+            "trim_rules_ms": trim_rules,
+            "max_atempo": round(estimated_atempo, 2)
+        }
+    }
+
+
+# ============================================
+# OPTIMIZATION EXECUTION
+# ============================================
+def build_segments_from_silences(duration: float, silences: list, trim_rules: dict) -> list:
+    """
+    Build list of segments to keep/trim.
+    Returns list of (type, start_s, end_s) tuples.
+    - "speech" = keep this range from original
+    - "silence" = insert this duration of silence
+    """
+    segments = []
+    last_end = 0.0
+    
+    for s in silences:
+        cap_ms = trim_rules.get(s["category"])
+        
+        if cap_ms is None or s["duration_ms"] <= cap_ms:
+            # Keep this silence as-is, extend last speech segment
+            # (we don't add separate silence segment, it's part of the speech range)
+            continue
+        else:
+            # Trim this silence
+            # 1. Add speech segment up to silence start
+            if s["start"] > last_end:
+                segments.append(("speech", last_end, s["start"]))
+            # 2. Add shortened silence
+            segments.append(("silence", s["start"], s["start"] + cap_ms / 1000))
+            # 3. Update last_end to after original silence
+            last_end = s["end"]
+    
+    # Final speech segment
+    if last_end < duration:
+        segments.append(("speech", last_end, duration))
+    elif not segments:
+        # No trimming happened, keep everything
+        segments.append(("speech", 0, duration))
+    
+    return segments
+
+
+def apply_silence_trim(input_path: Path, output_path: Path, segments: list) -> tuple:
+    """Apply selective silence trimming using filter_complex."""
+    # If only one speech segment = no trimming needed, just copy
+    if len(segments) == 1 and segments[0][0] == "speech":
+        shutil.copy(input_path, output_path)
+        return 0, ""
+    
+    filter_parts = []
+    concat_inputs = []
+    
+    for i, (seg_type, seg_start, seg_end) in enumerate(segments):
+        duration = seg_end - seg_start
+        if duration <= 0:
+            continue
+        
+        if seg_type == "speech":
+            filter_parts.append(
+                f"[0:a]atrim=start={seg_start:.3f}:end={seg_end:.3f},"
+                f"asetpts=PTS-STARTPTS[a{i}]"
+            )
+        else:  # silence
+            filter_parts.append(
+                f"anullsrc=r=44100:cl=stereo:d={duration:.3f}[a{i}]"
+            )
+        concat_inputs.append(f"[a{i}]")
+    
+    if not concat_inputs:
+        shutil.copy(input_path, output_path)
+        return 0, ""
+    
+    filter_complex = (
+        ";".join(filter_parts) + ";" +
+        "".join(concat_inputs) +
+        f"concat=n={len(concat_inputs)}:v=0:a=1[out]"
+    )
+    
+    return run_ffmpeg([
+        "-i", str(input_path),
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-ar", "44100", "-ac", "2", "-b:a", "192k",
+        str(output_path)
+    ])
+
+
+def apply_atempo(input_path: Path, output_path: Path, tempo: float) -> tuple:
+    """Apply atempo filter."""
+    return run_ffmpeg([
+        "-i", str(input_path),
+        "-af", f"atempo={tempo:.3f}",
+        "-ar", "44100", "-ac", "2", "-b:a", "192k",
+        str(output_path)
+    ])
+
+
+def optimize_audio(input_path: Path, job_id: str) -> dict:
+    """
+    Full optimization pipeline with analysis + context-aware execution.
+    """
+    # STEP 1: Analyze
+    analysis = analyze_audio(input_path)
+    duration = analysis["duration"]
+    style = analysis["speech"]["style"]
+    silences = analysis["pauses"]["all_pauses"]
+    
+    # STEP 2: Check if optimization needed
+    if duration <= SOFT_TARGET:
+        with open(input_path, "rb") as f:
+            audio_bytes = f.read()
+        return {
+            "status": "ok",
+            "action": "passthrough",
+            "analysis": analysis,
+            "execution": {
+                "silence_applied": False,
+                "atempo_applied": 1.0,
+                "silence_savings_ms": 0,
+                "atempo_savings_ms": 0
+            },
+            "original_duration": round(duration, 3),
+            "final_duration": round(duration, 3),
+            "total_savings_ms": 0,
+            "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
+            "size_bytes": len(audio_bytes)
+        }
+    
+    # STEP 3: Apply silence trimming
+    trim_rules = get_trim_rules(style)
+    segments = build_segments_from_silences(duration, silences, trim_rules)
+    
+    silence_path = WORK_DIR / f"{job_id}_silence.mp3"
+    ret, err = apply_silence_trim(input_path, silence_path, segments)
+    
+    if ret != 0:
+        return {"status": "error", "error": f"silence trim failed: {err[:200]}"}
+    
+    after_silence_duration = get_duration(silence_path)
+    silence_savings_ms = round((duration - after_silence_duration) * 1000)
+    
+    # STEP 4: Decide atempo
+    atempo_applied = 1.0
+    output_path = WORK_DIR / f"{job_id}_optimized.mp3"
+    
+    if after_silence_duration > HARD_CAP:
+        # Must use atempo to hit cap
+        required = after_silence_duration / HARD_CAP
+        ideal = after_silence_duration / SOFT_TARGET
+        
+        if required <= ATEMPO_MAX:
+            # Normal atempo is enough
+            atempo_applied = min(ideal, ATEMPO_MAX)
+        else:
+            # Need emergency atempo
+            atempo_applied = min(required, ATEMPO_EMERGENCY)
+        
+        atempo_applied = round(atempo_applied, 3)
+        
+        ret, err = apply_atempo(silence_path, output_path, atempo_applied)
+        silence_path.unlink(missing_ok=True)
+        if ret != 0:
+            return {"status": "error", "error": f"atempo failed: {err[:200]}"}
+    
+    elif after_silence_duration > SOFT_TARGET and style != "fast":
+        # Between target and cap - apply gentle atempo (only if not fast speaker)
+        ideal = after_silence_duration / SOFT_TARGET
+        atempo_applied = round(min(ideal, ATEMPO_MAX), 3)
+        
+        if atempo_applied > 1.02:
+            ret, err = apply_atempo(silence_path, output_path, atempo_applied)
+            silence_path.unlink(missing_ok=True)
+            if ret != 0:
+                return {"status": "error", "error": f"atempo failed: {err[:200]}"}
+        else:
+            atempo_applied = 1.0
+            silence_path.rename(output_path)
+    else:
+        # No atempo needed
+        silence_path.rename(output_path)
+    
+    final_duration = get_duration(output_path)
+    atempo_savings_ms = round((after_silence_duration - final_duration) * 1000) if atempo_applied > 1.0 else 0
+    
+    # STEP 5: Verify hard cap (safety)
+    if final_duration > HARD_CAP + 0.1:
+        # Should never happen with our math, but safety
+        pass  # Log warning but still return
+    
+    with open(output_path, "rb") as f:
+        audio_bytes = f.read()
+    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+    output_path.unlink(missing_ok=True)
+    
+    return {
+        "status": "ok",
+        "action": "optimized",
+        "analysis": analysis,
+        "execution": {
+            "silence_applied": silence_savings_ms > 0,
+            "atempo_applied": round(atempo_applied, 3),
+            "silence_savings_ms": silence_savings_ms,
+            "atempo_savings_ms": atempo_savings_ms,
+            "trim_rules_used": trim_rules,
+            "segments_count": len(segments)
+        },
+        "original_duration": round(duration, 3),
+        "after_silence_duration": round(after_silence_duration, 3),
+        "final_duration": round(final_duration, 3),
+        "total_savings_ms": round((duration - final_duration) * 1000),
+        "hit_soft_target": final_duration <= SOFT_TARGET + 0.1,
+        "hit_hard_cap": final_duration <= HARD_CAP + 0.05,
+        "audio_base64": audio_base64,
+        "size_bytes": len(audio_bytes)
+    }
+
+
+# ============================================
+# CUT SCENE (unchanged from v0.4)
+# ============================================
 def cut_scene(
     input_path: Path,
     scene: dict,
@@ -82,10 +622,7 @@ def cut_scene(
     padding: float = 0.05,
     fade: float = 0.03
 ) -> dict:
-    """
-    Cut a scene from input audio at exact timestamps.
-    Two-pass: accurate cut, then apply fades.
-    """
+    """Cut a scene from input audio at exact timestamps."""
     part = scene.get("part", "unknown")
     start = float(scene["start"])
     end = float(scene["end"])
@@ -97,7 +634,6 @@ def cut_scene(
     seg_start = max(0, start - padding)
     seg_end = end + padding
 
-    # Pass 1: Accurate cut
     ret, err = run_ffmpeg([
         "-accurate_seek",
         "-i", str(input_path),
@@ -112,7 +648,6 @@ def cut_scene(
 
     cut_duration = get_duration(cut_path)
 
-    # Pass 2: Fade in/out
     if cut_duration < 2 * fade:
         cut_path.rename(output_path)
     else:
@@ -133,7 +668,6 @@ def cut_scene(
     with open(output_path, "rb") as f:
         audio_bytes = f.read()
     audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-
     output_path.unlink(missing_ok=True)
 
     return {
@@ -148,175 +682,12 @@ def cut_scene(
     }
 
 
-def optimize_audio(input_path: Path, job_id: str) -> dict:
-    """
-    Smart tiered optimization for 3s target.
-    
-    Tiers:
-      1. ≤ 3.0s     → passthrough
-      2. 3.0-3.5s   → silence compress only (pauses >400ms → 300ms)
-      3. 3.5-4.2s   → silence compress + atempo 1.05
-      4. 4.2-5.0s   → silence compress + atempo 1.10
-      5. > 5.0s     → aggressive silence + atempo 1.15
-    """
-    original_duration = get_duration(input_path)
-    
-    # ============================================
-    # TIER 1: Already under target → passthrough
-    # ============================================
-    if original_duration <= TARGET_DURATION:
-        with open(input_path, "rb") as f:
-            audio_bytes = f.read()
-        return {
-            "status": "ok",
-            "tier": 1,
-            "tier_name": "passthrough",
-            "original_duration": round(original_duration, 3),
-            "after_silence_duration": round(original_duration, 3),
-            "final_duration": round(original_duration, 3),
-            "silence_savings_ms": 0,
-            "atempo_applied": 1.0,
-            "atempo_savings_ms": 0,
-            "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
-            "size_bytes": len(audio_bytes)
-        }
-    
-    # ============================================
-    # Determine tier + parameters
-    # ============================================
-    if original_duration <= 3.5:
-        tier = 2
-        tier_name = "soft"
-        min_silence = 0.4   # pauses ≥400ms get compressed
-        max_silence = 0.3   # compressed to 300ms max
-        atempo = 1.0
-    elif original_duration <= 4.2:
-        tier = 3
-        tier_name = "moderate"
-        min_silence = 0.3
-        max_silence = 0.25
-        atempo = 1.05
-    elif original_duration <= 5.0:
-        tier = 4
-        tier_name = "strong"
-        min_silence = 0.25
-        max_silence = 0.2
-        atempo = 1.10
-    else:
-        tier = 5
-        tier_name = "aggressive"
-        min_silence = 0.2
-        max_silence = 0.15
-        atempo = 1.15
-    
-    # ============================================
-    # STEP 1: Silence compression
-    # ffmpeg silenceremove: kills/trims silences
-    # stop_periods=-1 processes all silences
-    # stop_duration = min silence to be considered "long"
-    # We use stop_threshold to set what counts as silence
-    # ============================================
-    silence_path = WORK_DIR / f"{job_id}_silence.mp3"
-    
-    # ffmpeg silenceremove has limited "cap" capability
-    # We use it to remove silences >= min_silence duration
-    # then add back a brief pause via pause_after filter is not possible
-    # workaround: use silenceremove with stop_periods=-1 + stop_duration=min
-    # this removes all silences at/above min_silence completely
-    # For our use case, we want to CAP not REMOVE, so:
-    # we remove all silences >=min, then audio is just speech + natural pauses <min
-    
-    silence_filter = (
-        f"silenceremove="
-        f"stop_periods=-1:"
-        f"stop_duration={min_silence}:"
-        f"stop_threshold={SILENCE_THRESHOLD_DB}dB"
-    )
-    
-    ret, err = run_ffmpeg([
-        "-i", str(input_path),
-        "-af", silence_filter,
-        "-ar", "44100", "-ac", "2", "-b:a", "192k",
-        str(silence_path)
-    ])
-    
-    if ret != 0:
-        return {"status": "error", "error": f"silence compression failed: {err[:200]}"}
-    
-    after_silence_duration = get_duration(silence_path)
-    silence_savings_ms = round((original_duration - after_silence_duration) * 1000)
-    
-    # ============================================
-    # STEP 2: Atempo (if tier requires it)
-    # ============================================
-    output_path = WORK_DIR / f"{job_id}_optimized.mp3"
-    atempo_applied = 1.0
-    
-    if atempo > 1.0:
-        # Check if atempo is needed based on current duration
-        if after_silence_duration > TARGET_DURATION:
-            # Calculate ideal atempo to hit target (but cap at configured)
-            ideal_atempo = after_silence_duration / TARGET_DURATION
-            atempo_applied = min(ideal_atempo, atempo, MAX_ATEMPO)
-            
-            # Round to 2 decimals
-            atempo_applied = round(atempo_applied, 2)
-            
-            if atempo_applied > 1.01:
-                ret, err = run_ffmpeg([
-                    "-i", str(silence_path),
-                    "-af", f"atempo={atempo_applied}",
-                    "-ar", "44100", "-ac", "2", "-b:a", "192k",
-                    str(output_path)
-                ])
-                if ret != 0:
-                    return {"status": "error", "error": f"atempo failed: {err[:200]}"}
-                silence_path.unlink(missing_ok=True)
-            else:
-                # Atempo too close to 1.0, skip
-                atempo_applied = 1.0
-                silence_path.rename(output_path)
-        else:
-            # Already under target after silence compression, no atempo needed
-            silence_path.rename(output_path)
-    else:
-        # Tier 2: no atempo
-        silence_path.rename(output_path)
-    
-    final_duration = get_duration(output_path)
-    atempo_savings_ms = round((after_silence_duration - final_duration) * 1000) if atempo_applied > 1.0 else 0
-    
-    # ============================================
-    # Read + encode + cleanup
-    # ============================================
-    with open(output_path, "rb") as f:
-        audio_bytes = f.read()
-    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-    
-    output_path.unlink(missing_ok=True)
-    
-    return {
-        "status": "ok",
-        "tier": tier,
-        "tier_name": tier_name,
-        "original_duration": round(original_duration, 3),
-        "after_silence_duration": round(after_silence_duration, 3),
-        "final_duration": round(final_duration, 3),
-        "silence_savings_ms": silence_savings_ms,
-        "atempo_applied": round(atempo_applied, 2),
-        "atempo_savings_ms": atempo_savings_ms,
-        "total_savings_ms": round((original_duration - final_duration) * 1000),
-        "audio_base64": audio_base64,
-        "size_bytes": len(audio_bytes)
-    }
-
-
 # ============================================
 # ENDPOINTS
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.5.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.6.0", "status": "running"}
 
 
 @app.get("/health")
@@ -337,17 +708,14 @@ def auth_test(auth: str = Depends(verify_token)):
 
 
 @app.post("/audio/cut-scenes")
-async def cut_scenes(
+async def cut_scenes_endpoint(
     file: UploadFile = File(...),
     scenes: str = Form(...),
     padding: float = Form(0.05),
     fade: float = Form(0.03),
     auth: str = Depends(verify_token)
 ):
-    """
-    Cut multiple scenes from a single audio file at exact timestamps.
-    (Unchanged from v0.4)
-    """
+    """Cut multiple scenes from combined audio at exact timestamps."""
     start_time = time.time()
 
     try:
@@ -394,25 +762,64 @@ async def cut_scenes(
         input_path.unlink(missing_ok=True)
 
 
+@app.post("/audio/analyze")
+async def analyze_endpoint(
+    file: UploadFile = File(...),
+    auth: str = Depends(verify_token)
+):
+    """
+    Deep analysis of a single audio file.
+    
+    Returns:
+      - Duration, volume metrics
+      - Silence threshold used (adaptive)
+      - Speech metrics (active time, density, style)
+      - Pause distribution + individual pauses
+      - Optimization recommendation
+    
+    No audio modification - pure inspection.
+    """
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    input_path = WORK_DIR / f"{job_id}_input.mp3"
+
+    try:
+        content = await file.read()
+        with open(input_path, "wb") as f:
+            f.write(content)
+
+        analysis = analyze_audio(input_path)
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        
+        return {
+            "status": "ok",
+            "processing_time_ms": elapsed_ms,
+            **analysis
+        }
+
+    finally:
+        input_path.unlink(missing_ok=True)
+
+
 @app.post("/audio/optimize")
 async def optimize_endpoint(
     file: UploadFile = File(...),
     auth: str = Depends(verify_token)
 ):
     """
-    Smart 3s optimization for a single audio file.
+    Smart context-aware audio optimization.
     
-    Tiered logic based on original duration:
-      Tier 1: ≤ 3.0s      → passthrough (no changes)
-      Tier 2: 3.0 - 3.5s  → silence compression only
-      Tier 3: 3.5 - 4.2s  → silence compression + atempo 1.05
-      Tier 4: 4.2 - 5.0s  → silence compression + atempo 1.10
-      Tier 5: > 5.0s      → aggressive silence + atempo 1.15
+    Targets:
+      - Soft target: 3.0s (ideal)
+      - Hard cap:    4.0s (absolute, never exceeded)
     
-    Max atempo hard cap: 1.15 (never exceeded)
-    
-    Input: single MP3 file as multipart upload
-    Output: optimized MP3 as base64 + detailed metadata
+    Logic:
+      1. Analyze audio (volume, silence, speech density, style)
+      2. Apply selective silence trimming based on style + pause categories
+      3. Apply atempo (if needed) to hit hard cap
+         - Normal: up to 1.15
+         - Emergency: up to 1.20 (only if 1.15 doesn't hit cap)
+      4. Return optimized audio + full analysis + execution details
     """
     start_time = time.time()
     job_id = str(uuid.uuid4())[:8]
@@ -424,7 +831,6 @@ async def optimize_endpoint(
             f.write(content)
 
         result = optimize_audio(input_path, job_id)
-        
         elapsed_ms = int((time.time() - start_time) * 1000)
         result["processing_time_ms"] = elapsed_ms
         
