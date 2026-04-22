@@ -1,6 +1,6 @@
 """
-FFmpeg HTTP Service v0.8.1
-Smart audio cutting + context-aware optimization + edge silence trim + symmetric padding for UGC ad pipeline.
+FFmpeg HTTP Service v0.9
+Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
@@ -8,27 +8,31 @@ Endpoints:
   GET  /auth-test           - Auth verification
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, optional symmetric padding)
+  POST /video/analyze       - Analyze video's audio track (NEW v0.9)
+  POST /video/smart-cut     - Auto-trim leading/trailing silence from video (NEW v0.9)
+  POST /video/speedup       - Speed up video + audio with constant pitch (NEW v0.9)
+  POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker (NEW v0.9)
+
+Changelog v0.9:
+  - NEW: Video endpoints for post-Seedance processing
+  - /video/analyze: extract audio track and run full analysis
+  - /video/smart-cut: trim leading/trailing silence from video (preserves mid-speech)
+  - /video/speedup: constant-pitch speed change using setpts + atempo
+  - /video/optimize: combined pipeline with auto speed recommendation based on speech style
+  - All video endpoints handle video+audio in sync (setpts for video, atempo for audio)
 
 Changelog v0.8.1:
-  - NEW: Auto-trim leading silence (pauses at very start of audio, >50ms)
-  - NEW: Auto-trim trailing silence (pauses at very end of audio, >50ms)
-  - Edge silences are ALWAYS trimmed regardless of style rules
+  - Auto-trim leading/trailing silence in /audio/optimize
   - Mid-speech pauses still use style-based rules (preserves natural breath)
-  - Significantly improves silence savings for files with TTS lead-in/lead-out silence
-  - 2% safety margin on atempo calculation (avoid ffmpeg approximation overshoot)
+  - 2% safety margin on atempo calculation
 
 Changelog v0.8:
-  - NEW: Symmetric padding feature for Seedance video generation
-  - Optional form param `pad_to_duration` (float, 0.5-15.0s) on /audio/optimize
-  - When set, pads audio symmetrically (front + back silence) to reach exact target duration
-  - Example: content 2.6s + pad_to_duration=4.0 -> 0.7s silence + 2.6s content + 0.7s silence = 4.0s
-  - Helps Seedance render full video duration with complete voice delivery
-  - No-op if audio is already >= target duration
+  - Symmetric padding feature for Seedance video generation
+  - Optional form param `pad_to_duration` on /audio/optimize
 
 Changelog v0.7:
   - Removed /audio/analyze endpoint (analysis bundled inside /audio/optimize)
   - Style-scaled atempo caps: Fast 1.08, Normal 1.12, Slow 1.15
-  - Atempo applied to all styles between soft target and hard cap
 """
 
 import subprocess
@@ -45,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.8.1")
+app = FastAPI(title="FFmpeg Service", version="0.9.0")
 
 # ============================================
 # CONFIG
@@ -806,7 +810,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.8.1", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.0", "status": "running"}
 
 
 @app.get("/health")
@@ -943,3 +947,518 @@ async def optimize_endpoint(
 
     finally:
         input_path.unlink(missing_ok=True)
+
+
+# ============================================
+# VIDEO HELPERS (v0.9)
+# ============================================
+def extract_audio_from_video(video_path: Path, audio_path: Path) -> tuple:
+    """Extract audio track from video as MP3 for analysis."""
+    return run_ffmpeg([
+        "-i", str(video_path),
+        "-vn",
+        "-ar", "44100", "-ac", "2", "-b:a", "192k",
+        str(audio_path)
+    ])
+
+
+def cut_video_segment(input_path: Path, output_path: Path, start: float, end: float) -> tuple:
+    """Cut video+audio to [start, end] range. Re-encodes for accurate cuts."""
+    duration = end - start
+    return run_ffmpeg([
+        "-accurate_seek",
+        "-ss", f"{start:.3f}",
+        "-i", str(input_path),
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ])
+
+
+def speedup_video(input_path: Path, output_path: Path, speed: float) -> tuple:
+    """
+    Speed up video+audio with constant pitch.
+    setpts=PTS/speed for video, atempo=speed for audio.
+    """
+    if speed <= 1.001:
+        # No meaningful speedup - just copy
+        shutil.copy(input_path, output_path)
+        return 0, ""
+    
+    # atempo filter supports 0.5-2.0 range, chain if needed
+    atempo_chain = f"atempo={speed:.4f}"
+    if speed > 2.0:
+        atempo_chain = "atempo=2.0,atempo=" + f"{(speed/2.0):.4f}"
+    
+    return run_ffmpeg([
+        "-i", str(input_path),
+        "-filter_complex", f"[0:v]setpts=PTS/{speed:.4f}[v];[0:a]{atempo_chain}[a]",
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ])
+
+
+# ============================================
+# UGC PROFILES (v0.9)
+# ============================================
+UGC_PROFILES = {
+    "snappy": {
+        "target_final_duration": 2.8,
+        "target_density": 0.88,
+        "max_pause_ms": 200,
+        "max_speedup": 1.25,
+    },
+    "natural": {
+        "target_final_duration": 3.2,
+        "target_density": 0.82,
+        "max_pause_ms": 250,
+        "max_speedup": 1.20,
+    },
+    "relaxed": {
+        "target_final_duration": 3.8,
+        "target_density": 0.75,
+        "max_pause_ms": 350,
+        "max_speedup": 1.15,
+    },
+}
+
+
+def decide_video_optimization(analysis: dict, duration: float, profile: dict) -> dict:
+    """
+    Decide how to optimize the video based on audio analysis and UGC profile.
+    
+    Returns:
+        dict with decisions:
+          - trim_start, trim_end (video cut boundaries)
+          - speedup (1.0 if not needed)
+          - classification (too_slow/good/too_fast)
+          - reasoning
+    """
+    silences = analysis["pauses"]["all_pauses"]
+    
+    # Identify edge silences (leading/trailing dead air)
+    leading_silence = None
+    trailing_silence = None
+    
+    if silences:
+        if silences[0]["start"] <= EDGE_TOLERANCE and silences[0]["duration_ms"] > EDGE_SILENCE_MIN_MS:
+            leading_silence = silences[0]
+        if silences[-1]["end"] >= duration - EDGE_TOLERANCE and silences[-1]["duration_ms"] > EDGE_SILENCE_MIN_MS:
+            if silences[-1] is not leading_silence:
+                trailing_silence = silences[-1]
+    
+    # Calculate cut boundaries (keep 50ms buffer on each edge)
+    keep_seconds = EDGE_SILENCE_KEEP_MS / 1000
+    if leading_silence:
+        trim_start = max(0, leading_silence["end"] - keep_seconds)
+    else:
+        trim_start = 0.0
+    
+    if trailing_silence:
+        trim_end = min(duration, trailing_silence["start"] + keep_seconds)
+    else:
+        trim_end = duration
+    
+    trimmed_duration = trim_end - trim_start
+    
+    # Recalculate density AFTER trimming (only count mid-speech silence)
+    mid_silence_ms = 0
+    for s in silences:
+        if s is leading_silence or s is trailing_silence:
+            continue
+        mid_silence_ms += s["duration_ms"]
+    
+    speech_time = trimmed_duration - (mid_silence_ms / 1000)
+    trimmed_density = speech_time / trimmed_duration if trimmed_duration > 0 else 1.0
+    
+    # Calculate onset rate (speech onsets per second)
+    mid_silences = [s for s in silences if s is not leading_silence and s is not trailing_silence]
+    onset_rate = (len(mid_silences) + 1) / trimmed_duration if trimmed_duration > 0 else 0
+    
+    # Pace classification
+    avg_mid_pause_ms = (mid_silence_ms / len(mid_silences)) if mid_silences else 0
+    
+    # Score against profile
+    target_density = profile["target_density"]
+    density_ratio = trimmed_density / target_density
+    
+    target_duration = profile["target_final_duration"]
+    duration_ratio = trimmed_duration / target_duration
+    
+    # Classify delivery
+    if trimmed_density < target_density * 0.90 or duration_ratio > 1.15:
+        classification = "too_slow"
+    elif duration_ratio < 0.85 and trimmed_density > target_density * 1.05:
+        classification = "too_fast"
+    else:
+        classification = "good"
+    
+    # Calculate speedup
+    speedup = 1.0
+    speedup_reason = "already in target range"
+    
+    if classification == "too_slow" and trimmed_duration > target_duration:
+        ideal_speedup = trimmed_duration / target_duration
+        speedup = min(ideal_speedup, profile["max_speedup"])
+        speedup = round(speedup, 3)
+        speedup_reason = f"speeding up from {trimmed_duration:.2f}s toward {target_duration:.2f}s target"
+    elif classification == "too_slow":
+        # Slow but already short enough - minimal speedup
+        speedup = 1.0
+        speedup_reason = "slow pace but duration already acceptable"
+    
+    final_duration = trimmed_duration / speedup if speedup > 1.0 else trimmed_duration
+    
+    return {
+        "trim_start": round(trim_start, 3),
+        "trim_end": round(trim_end, 3),
+        "trimmed_duration": round(trimmed_duration, 3),
+        "leading_silence_ms": leading_silence["duration_ms"] if leading_silence else 0,
+        "trailing_silence_ms": trailing_silence["duration_ms"] if trailing_silence else 0,
+        "mid_silence_ms": round(mid_silence_ms),
+        "avg_mid_pause_ms": round(avg_mid_pause_ms),
+        "trimmed_density": round(trimmed_density, 3),
+        "onset_rate": round(onset_rate, 2),
+        "classification": classification,
+        "speedup": speedup,
+        "speedup_reason": speedup_reason,
+        "estimated_final_duration": round(final_duration, 3),
+    }
+
+
+# ============================================
+# VIDEO ENDPOINTS (v0.9)
+# ============================================
+@app.post("/video/analyze")
+async def video_analyze_endpoint(
+    file: UploadFile = File(...),
+    auth: str = Depends(verify_token)
+):
+    """
+    Extract audio from video and run full analysis.
+    Useful for understanding Seedance output before deciding trim/speedup.
+    """
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    video_path = WORK_DIR / f"{job_id}_input.mp4"
+    audio_path = WORK_DIR / f"{job_id}_extracted.mp3"
+    
+    try:
+        content = await file.read()
+        with open(video_path, "wb") as f:
+            f.write(content)
+        
+        video_duration = get_duration(video_path)
+        
+        ret, err = extract_audio_from_video(video_path, audio_path)
+        if ret != 0:
+            return {"status": "error", "error": f"audio extraction failed: {err[:200]}"}
+        
+        analysis = analyze_audio(audio_path)
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return {
+            "status": "ok",
+            "video_duration": round(video_duration, 3),
+            "audio_analysis": analysis,
+            "processing_time_ms": elapsed_ms
+        }
+    
+    finally:
+        video_path.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
+
+
+@app.post("/video/smart-cut")
+async def video_smart_cut_endpoint(
+    file: UploadFile = File(...),
+    buffer_ms: int = Form(50),
+    auth: str = Depends(verify_token)
+):
+    """
+    Auto-trim leading and trailing silence from video.
+    Preserves all mid-speech content and pauses.
+    
+    Uses same silence detection as /audio/optimize edge trim.
+    """
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    video_path = WORK_DIR / f"{job_id}_input.mp4"
+    audio_path = WORK_DIR / f"{job_id}_extracted.mp3"
+    output_path = WORK_DIR / f"{job_id}_cut.mp4"
+    
+    try:
+        content = await file.read()
+        with open(video_path, "wb") as f:
+            f.write(content)
+        
+        video_duration = get_duration(video_path)
+        
+        # Extract audio and analyze
+        ret, err = extract_audio_from_video(video_path, audio_path)
+        if ret != 0:
+            return {"status": "error", "error": f"audio extraction failed: {err[:200]}"}
+        
+        analysis = analyze_audio(audio_path)
+        audio_path.unlink(missing_ok=True)
+        
+        silences = analysis["pauses"]["all_pauses"]
+        
+        # Detect edge silences
+        leading_silence = None
+        trailing_silence = None
+        
+        if silences:
+            if silences[0]["start"] <= EDGE_TOLERANCE and silences[0]["duration_ms"] > EDGE_SILENCE_MIN_MS:
+                leading_silence = silences[0]
+            if silences[-1]["end"] >= video_duration - EDGE_TOLERANCE and silences[-1]["duration_ms"] > EDGE_SILENCE_MIN_MS:
+                if silences[-1] is not leading_silence:
+                    trailing_silence = silences[-1]
+        
+        # Calculate cut boundaries
+        buffer_s = buffer_ms / 1000
+        trim_start = max(0, leading_silence["end"] - buffer_s) if leading_silence else 0.0
+        trim_end = min(video_duration, trailing_silence["start"] + buffer_s) if trailing_silence else video_duration
+        
+        # If no edge silence detected, just pass through
+        if trim_start <= 0.01 and trim_end >= video_duration - 0.01:
+            shutil.copy(video_path, output_path)
+            final_duration = video_duration
+            action = "passthrough"
+        else:
+            ret, err = cut_video_segment(video_path, output_path, trim_start, trim_end)
+            if ret != 0:
+                return {"status": "error", "error": f"cut failed: {err[:200]}"}
+            final_duration = get_duration(output_path)
+            action = "cut"
+        
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+        output_path.unlink(missing_ok=True)
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return {
+            "status": "ok",
+            "action": action,
+            "original_duration": round(video_duration, 3),
+            "trim_start": round(trim_start, 3),
+            "trim_end": round(trim_end, 3),
+            "final_duration": round(final_duration, 3),
+            "leading_silence_trimmed_ms": leading_silence["duration_ms"] - buffer_ms if leading_silence else 0,
+            "trailing_silence_trimmed_ms": trailing_silence["duration_ms"] - buffer_ms if trailing_silence else 0,
+            "video_base64": video_b64,
+            "size_bytes": len(video_bytes),
+            "processing_time_ms": elapsed_ms
+        }
+    
+    finally:
+        video_path.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
+
+
+@app.post("/video/speedup")
+async def video_speedup_endpoint(
+    file: UploadFile = File(...),
+    speed: float = Form(1.15),
+    auth: str = Depends(verify_token)
+):
+    """
+    Speed up video + audio with constant pitch.
+    Useful for tightening slow-paced Seedance output.
+    
+    Speed range: 0.5 - 2.0 (recommended: 1.0 - 1.25 for UGC)
+    """
+    if speed < 0.5 or speed > 2.0:
+        raise HTTPException(400, "speed must be between 0.5 and 2.0")
+    
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    video_path = WORK_DIR / f"{job_id}_input.mp4"
+    output_path = WORK_DIR / f"{job_id}_speedup.mp4"
+    
+    try:
+        content = await file.read()
+        with open(video_path, "wb") as f:
+            f.write(content)
+        
+        original_duration = get_duration(video_path)
+        
+        ret, err = speedup_video(video_path, output_path, speed)
+        if ret != 0:
+            return {"status": "error", "error": f"speedup failed: {err[:200]}"}
+        
+        final_duration = get_duration(output_path)
+        
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+        output_path.unlink(missing_ok=True)
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return {
+            "status": "ok",
+            "original_duration": round(original_duration, 3),
+            "speed_applied": round(speed, 3),
+            "final_duration": round(final_duration, 3),
+            "video_base64": video_b64,
+            "size_bytes": len(video_bytes),
+            "processing_time_ms": elapsed_ms
+        }
+    
+    finally:
+        video_path.unlink(missing_ok=True)
+
+
+@app.post("/video/optimize")
+async def video_optimize_endpoint(
+    file: UploadFile = File(...),
+    profile: str = Form("snappy"),
+    target_duration: Optional[float] = Form(None),
+    max_speedup: Optional[float] = Form(None),
+    apply_trim: bool = Form(True),
+    apply_speedup: bool = Form(True),
+    auth: str = Depends(verify_token)
+):
+    """
+    Combined video optimization: analyze + smart-cut + auto-speedup.
+    
+    Logic (v0.9):
+      1. Extract audio, run full analysis
+      2. Calculate optimal trim boundaries + speedup based on UGC profile
+      3. Apply: trim edges, then speedup if still too slow
+      4. Return optimized video + decision details
+    
+    UGC Profiles:
+      - snappy:  2.8s target, 0.88 density, max 1.25x speedup (TikTok)
+      - natural: 3.2s target, 0.82 density, max 1.20x speedup (IG Reels)
+      - relaxed: 3.8s target, 0.75 density, max 1.15x speedup (YT Shorts)
+    
+    Form params:
+      file:              Video file (MP4)
+      profile:           UGC profile: "snappy", "natural", or "relaxed" (default: snappy)
+      target_duration:   Optional override for target duration
+      max_speedup:       Optional override for max speedup cap
+      apply_trim:        If True, trim leading/trailing silence (default: True)
+      apply_speedup:     If True, apply speedup if classified too_slow (default: True)
+    """
+    if profile not in UGC_PROFILES:
+        raise HTTPException(400, f"profile must be one of: {list(UGC_PROFILES.keys())}")
+    
+    profile_settings = dict(UGC_PROFILES[profile])
+    if target_duration is not None:
+        profile_settings["target_final_duration"] = target_duration
+    if max_speedup is not None:
+        profile_settings["max_speedup"] = max_speedup
+    
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    video_path = WORK_DIR / f"{job_id}_input.mp4"
+    audio_path = WORK_DIR / f"{job_id}_extracted.mp3"
+    cut_path = WORK_DIR / f"{job_id}_cut.mp4"
+    final_path = WORK_DIR / f"{job_id}_final.mp4"
+    
+    try:
+        content = await file.read()
+        with open(video_path, "wb") as f:
+            f.write(content)
+        
+        video_duration = get_duration(video_path)
+        
+        # Step 1: Extract audio and analyze
+        ret, err = extract_audio_from_video(video_path, audio_path)
+        if ret != 0:
+            return {"status": "error", "error": f"audio extraction failed: {err[:200]}"}
+        
+        analysis = analyze_audio(audio_path)
+        audio_path.unlink(missing_ok=True)
+        
+        # Step 2: Decide optimizations based on profile
+        decision = decide_video_optimization(analysis, video_duration, profile_settings)
+        
+        # Step 3: Apply trim if enabled and beneficial
+        current_path = video_path
+        actual_trim_applied = False
+        
+        if apply_trim and (decision["trim_start"] > 0.01 or decision["trim_end"] < video_duration - 0.01):
+            ret, err = cut_video_segment(
+                video_path, cut_path,
+                decision["trim_start"], decision["trim_end"]
+            )
+            if ret != 0:
+                return {"status": "error", "error": f"cut failed: {err[:200]}"}
+            current_path = cut_path
+            actual_trim_applied = True
+        
+        # Step 4: Apply speedup if enabled and needed
+        actual_speedup = 1.0
+        if apply_speedup and decision["speedup"] > 1.01:
+            ret, err = speedup_video(current_path, final_path, decision["speedup"])
+            if ret != 0:
+                return {"status": "error", "error": f"speedup failed: {err[:200]}"}
+            actual_speedup = decision["speedup"]
+            if current_path == cut_path:
+                cut_path.unlink(missing_ok=True)
+            current_path = final_path
+        
+        # If no operation applied, use original
+        if current_path == video_path:
+            shutil.copy(video_path, final_path)
+            current_path = final_path
+        elif current_path != final_path:
+            # Move cut result to final
+            current_path.rename(final_path)
+            current_path = final_path
+        
+        final_duration = get_duration(final_path)
+        
+        with open(final_path, "rb") as f:
+            video_bytes = f.read()
+        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+        final_path.unlink(missing_ok=True)
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        
+        # Determine action
+        if actual_trim_applied and actual_speedup > 1.0:
+            action = "trim_and_speedup"
+        elif actual_trim_applied:
+            action = "trim_only"
+        elif actual_speedup > 1.0:
+            action = "speedup_only"
+        else:
+            action = "passthrough"
+        
+        return {
+            "status": "ok",
+            "action": action,
+            "profile": profile,
+            "profile_settings": profile_settings,
+            "original_duration": round(video_duration, 3),
+            "audio_analysis": {
+                "style": analysis["speech"]["style"],
+                "density": analysis["speech"]["speech_density"],
+                "total_silence_ms": analysis["pauses"]["total_ms"],
+                "pause_count": analysis["pauses"]["count"],
+            },
+            "decision": decision,
+            "applied": {
+                "trim_applied": actual_trim_applied,
+                "speedup_applied": round(actual_speedup, 3),
+            },
+            "final_duration": round(final_duration, 3),
+            "video_base64": video_b64,
+            "size_bytes": len(video_bytes),
+            "processing_time_ms": elapsed_ms
+        }
+    
+    finally:
+        video_path.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
+        cut_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
