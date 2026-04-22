@@ -152,6 +152,101 @@ def detect_volume(input_path: Path) -> dict:
     }
 
 
+def analyze_rms_windows(input_path: Path, start: float, end: float, window_ms: int = 50) -> list:
+    """
+    Analyze RMS energy in sliding windows over a time range.
+    Returns list of (window_start_s, rms_db) tuples.
+    
+    Used to detect breath/puste at edges that silencedetect misses
+    (breath has energy but much lower than speech).
+    """
+    if end - start <= 0.05:
+        return []
+    
+    # Use astats with reset=<window_ms> to get per-window RMS measurements
+    window_s = window_ms / 1000
+    cmd = [
+        "ffmpeg", "-hide_banner",
+        "-ss", f"{start:.3f}",
+        "-i", str(input_path),
+        "-t", f"{end - start:.3f}",
+        "-af", f"astats=metadata=1:reset=1:length={window_s},ametadata=mode=print:key=lavfi.astats.Overall.RMS_level",
+        "-f", "null", "-"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    
+    windows = []
+    current_time = start
+    
+    for line in result.stderr.split("\n"):
+        # astats output format: lavfi.astats.Overall.RMS_level=-XX.XX
+        rms_match = re.search(r"lavfi\.astats\.Overall\.RMS_level=(-?[\d.]+|-?inf)", line)
+        if rms_match:
+            rms_str = rms_match.group(1)
+            if rms_str == "-inf":
+                rms_db = -100.0  # treat -inf as very low
+            else:
+                rms_db = float(rms_str)
+            windows.append((round(current_time, 3), round(rms_db, 2)))
+            current_time += window_s
+    
+    return windows
+
+
+def detect_trailing_breath(input_path: Path, analysis: dict, scan_duration: float = 0.8) -> float:
+    """
+    Detect trailing breath/puste that silencedetect missed.
+    
+    Strategy:
+      1. Calculate speech baseline RMS (from full-file mean)
+      2. Scan last N seconds in 50ms windows
+      3. Find where RMS drops below speech_floor (silence threshold + margin)
+      4. Return position where real speech ends
+    
+    Returns: estimated real speech end time (seconds from start of file)
+             If no breath detected, returns file duration unchanged.
+    """
+    duration = analysis["duration"]
+    mean_db = analysis["volume"]["mean_db"]
+    
+    if mean_db is None or duration < scan_duration:
+        return duration  # can't analyze, return unchanged
+    
+    # Speech floor: RMS that indicates real speech vs breath
+    # Mean is overall average; breath is typically 10-15dB below speech
+    # We set floor at mean - 8dB (anything quieter is suspect)
+    speech_floor_db = mean_db - 8.0
+    
+    # Scan the last `scan_duration` seconds
+    scan_start = max(0, duration - scan_duration)
+    windows = analyze_rms_windows(input_path, scan_start, duration, window_ms=50)
+    
+    if not windows:
+        return duration
+    
+    # Walk backwards through windows to find last "real speech" window
+    last_speech_time = duration
+    found_speech = False
+    
+    for window_time, rms_db in reversed(windows):
+        if rms_db >= speech_floor_db:
+            # This window has speech-level energy
+            last_speech_time = window_time + 0.05  # add window size
+            found_speech = True
+            break
+    
+    if not found_speech:
+        # No real speech found in scan range - unusual, return unchanged
+        return duration
+    
+    # Only trim if we actually found significant breath tail
+    breath_duration = duration - last_speech_time
+    if breath_duration < 0.08:  # less than 80ms - not worth trimming
+        return duration
+    
+    return round(last_speech_time, 3)
+
+
 def detect_silences(input_path: Path, threshold_db: float, min_duration: float = 0.08) -> list:
     """Detect all silence periods in audio."""
     cmd = [
@@ -923,9 +1018,17 @@ UGC_PROFILES = {
 }
 
 
-def decide_video_optimization(analysis: dict, duration: float, profile: dict) -> dict:
+def decide_video_optimization(
+    analysis: dict,
+    duration: float,
+    profile: dict,
+    audio_path: Optional[Path] = None
+) -> dict:
     """
     Decide how to optimize the video based on audio analysis and UGC profile.
+    
+    If audio_path is provided, runs RMS-based trailing breath detection
+    to catch puste/breath that silencedetect missed.
     
     Returns:
         dict with decisions:
@@ -958,6 +1061,22 @@ def decide_video_optimization(analysis: dict, duration: float, profile: dict) ->
         trim_end = min(duration, trailing_silence["start"] + keep_seconds)
     else:
         trim_end = duration
+    
+    # v0.9.1: Smart trailing breath detection via RMS scan
+    # Only trigger if silencedetect found NO trailing silence (likely missed breath)
+    breath_trim_applied = False
+    breath_trimmed_ms = 0
+    original_trim_end = trim_end
+    
+    if audio_path is not None and trailing_silence is None:
+        real_speech_end = detect_trailing_breath(audio_path, analysis, scan_duration=0.8)
+        if real_speech_end < duration - 0.05:
+            # Found breath tail - trim it (keep 50ms buffer)
+            proposed_trim_end = min(duration, real_speech_end + keep_seconds)
+            if proposed_trim_end < trim_end:
+                breath_trimmed_ms = round((trim_end - proposed_trim_end) * 1000)
+                trim_end = proposed_trim_end
+                breath_trim_applied = True
     
     trimmed_duration = trim_end - trim_start
     
@@ -994,6 +1113,47 @@ def decide_video_optimization(analysis: dict, duration: float, profile: dict) ->
     else:
         classification = "good"
     
+    # ============================================
+    # EMPHASIS DETECTION (v0.9.2)
+    # Distinguishes deliberate performance from actual slow delivery
+    # ============================================
+    emphasis_score = 0
+    emphasis_reasons = []
+    
+    if mid_silences:
+        mid_pause_durations = [s["duration_ms"] for s in mid_silences]
+        max_mid_pause = max(mid_pause_durations)
+        avg_pause_calc = sum(mid_pause_durations) / len(mid_pause_durations)
+        
+        # Signal 1: Few pauses (1-2) suggests deliberate delivery
+        if len(mid_silences) <= 2:
+            emphasis_score += 2
+            emphasis_reasons.append(f"few pauses ({len(mid_silences)})")
+        elif len(mid_silences) <= 3:
+            emphasis_score += 1
+            emphasis_reasons.append(f"moderate pause count ({len(mid_silences)})")
+        
+        # Signal 2: One pause stands out (dominant emphasis beat)
+        if avg_pause_calc > 0 and max_mid_pause / avg_pause_calc >= 1.5 and max_mid_pause >= 300:
+            emphasis_score += 2
+            emphasis_reasons.append(f"dominant pause ({max_mid_pause}ms vs avg {avg_pause_calc:.0f}ms)")
+        
+        # Signal 3: Long pauses (>=350ms) suggest dramatic beats
+        long_pauses = [p for p in mid_pause_durations if p >= 350]
+        if long_pauses:
+            emphasis_score += len(long_pauses)
+            emphasis_reasons.append(f"{len(long_pauses)} dramatic pauses (>=350ms)")
+    
+    # Signal 4: Genuinely slow (flat onset rate + slow style + no emphasis)
+    # Emphatic delivery has strategic pauses but moderate onset rate
+    style = analysis["speech"]["style"]
+    if style == "slow" and onset_rate < 1.0 and emphasis_score < 2:
+        emphasis_score -= 2
+        emphasis_reasons.append(f"flat slow delivery (onset rate {onset_rate:.2f})")
+    
+    # Classify: high emphasis = deliberate performance, low = just slow
+    is_emphatic = emphasis_score >= 3
+    
     # Calculate speedup (ALWAYS apply at least min_speedup unless too_fast)
     min_speedup_val = profile.get("min_speedup", 1.0)
     max_speedup_val = profile["max_speedup"]
@@ -1003,16 +1163,24 @@ def decide_video_optimization(analysis: dict, duration: float, profile: dict) ->
         speedup = 1.0
         speedup_reason = "already fast enough, no speedup applied"
     elif classification == "too_slow":
-        # Calculate ideal speedup to hit target, cap at max
-        if trimmed_duration > target_duration:
-            ideal_speedup = trimmed_duration / target_duration
-            speedup = min(ideal_speedup, max_speedup_val)
+        if is_emphatic:
+            # DELIBERATE performance with emphasis beats - respect the delivery
+            # Only apply gentle min_speedup
+            speedup = min_speedup_val
+            speedup_reason = f"emphatic delivery detected (score {emphasis_score}): {', '.join(emphasis_reasons)}. Gentle {min_speedup_val}x boost."
         else:
-            speedup = max_speedup_val
-        # But never less than min
-        speedup = max(speedup, min_speedup_val)
+            # Default for too_slow: use max_speedup (Seedance artificially stretches voice)
+            # Only scale down if file is very close to target (no need for max)
+            if trimmed_duration <= target_duration * 1.05:
+                # Within 5% of target - no aggressive speedup needed
+                speedup = min_speedup_val
+                speedup_reason = f"too_slow but close to target ({trimmed_duration:.2f}s): gentle {min_speedup_val}x boost"
+            else:
+                # Standard too_slow - apply max speedup to counter Seedance stretching
+                speedup = max_speedup_val
+                speedup_reason = f"too_slow, non-emphatic: max {max_speedup_val}x speedup (counters Seedance stretching)"
+        
         speedup = round(speedup, 3)
-        speedup_reason = f"too_slow: speeding up from {trimmed_duration:.2f}s toward {target_duration:.2f}s"
     else:
         # "good" classification - apply min_speedup for consistent UGC pace
         speedup = round(min_speedup_val, 3)
@@ -1026,10 +1194,15 @@ def decide_video_optimization(analysis: dict, duration: float, profile: dict) ->
         "trimmed_duration": round(trimmed_duration, 3),
         "leading_silence_ms": leading_silence["duration_ms"] if leading_silence else 0,
         "trailing_silence_ms": trailing_silence["duration_ms"] if trailing_silence else 0,
+        "breath_trim_applied": breath_trim_applied,
+        "breath_trimmed_ms": breath_trimmed_ms,
         "mid_silence_ms": round(mid_silence_ms),
         "avg_mid_pause_ms": round(avg_mid_pause_ms),
         "trimmed_density": round(trimmed_density, 3),
         "onset_rate": round(onset_rate, 2),
+        "emphasis_score": emphasis_score,
+        "emphasis_reasons": emphasis_reasons,
+        "is_emphatic": is_emphatic,
         "classification": classification,
         "speedup": speedup,
         "speedup_reason": speedup_reason,
@@ -1288,10 +1461,12 @@ async def video_optimize_endpoint(
             return {"status": "error", "error": f"audio extraction failed: {err[:200]}"}
         
         analysis = analyze_audio(audio_path)
-        audio_path.unlink(missing_ok=True)
         
-        # Step 2: Decide optimizations based on profile
-        decision = decide_video_optimization(analysis, video_duration, profile_settings)
+        # Step 2: Decide optimizations based on profile (uses audio_path for breath detection)
+        decision = decide_video_optimization(analysis, video_duration, profile_settings, audio_path=audio_path)
+        
+        # Audio path no longer needed after decision
+        audio_path.unlink(missing_ok=True)
         
         # Step 3: Apply trim if enabled and beneficial
         current_path = video_path
