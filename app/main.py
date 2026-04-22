@@ -1,6 +1,6 @@
 """
-FFmpeg HTTP Service v0.8
-Smart audio cutting + context-aware optimization + symmetric padding for UGC ad pipeline.
+FFmpeg HTTP Service v0.8.1
+Smart audio cutting + context-aware optimization + edge silence trim + symmetric padding for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
@@ -9,13 +9,20 @@ Endpoints:
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, optional symmetric padding)
 
+Changelog v0.8.1:
+  - NEW: Auto-trim leading silence (pauses at very start of audio, >50ms)
+  - NEW: Auto-trim trailing silence (pauses at very end of audio, >50ms)
+  - Edge silences are ALWAYS trimmed regardless of style rules
+  - Mid-speech pauses still use style-based rules (preserves natural breath)
+  - Significantly improves silence savings for files with TTS lead-in/lead-out silence
+  - 2% safety margin on atempo calculation (avoid ffmpeg approximation overshoot)
+
 Changelog v0.8:
   - NEW: Symmetric padding feature for Seedance video generation
   - Optional form param `pad_to_duration` (float, 0.5-15.0s) on /audio/optimize
   - When set, pads audio symmetrically (front + back silence) to reach exact target duration
-  - Example: content 2.6s + pad_to_duration 4.0s → 0.7s silence + 2.6s content + 0.7s silence = 4.0s
+  - Example: content 2.6s + pad_to_duration=4.0 -> 0.7s silence + 2.6s content + 0.7s silence = 4.0s
   - Helps Seedance render full video duration with complete voice delivery
-  - Silence is inserted BEFORE optimization result (not on original)
   - No-op if audio is already >= target duration
 
 Changelog v0.7:
@@ -38,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.8.0")
+app = FastAPI(title="FFmpeg Service", version="0.8.1")
 
 # ============================================
 # CONFIG
@@ -74,6 +81,11 @@ PAUSE_LONG_MAX = 800
 # Speech density thresholds
 DENSITY_FAST = 0.85
 DENSITY_NORMAL = 0.70
+
+# Edge silence (v0.8.1) - always trim leading/trailing silence
+EDGE_SILENCE_MIN_MS = 50      # trim edges only if they exceed this
+EDGE_SILENCE_KEEP_MS = 50     # but keep this much for natural fade-in/out
+EDGE_TOLERANCE = 0.05         # tolerance for detecting edge position (50ms)
 
 # Padding limits (v0.8)
 PAD_TO_DURATION_MIN = 0.5
@@ -369,12 +381,54 @@ def generate_recommendation(duration: float, style: str, silences: list, speech_
 # ============================================
 # OPTIMIZATION EXECUTION
 # ============================================
-def build_segments_from_silences(duration: float, silences: list, trim_rules: dict) -> list:
-    """Build list of segments to keep/trim."""
+def build_segments_from_silences(duration: float, silences: list, trim_rules: dict) -> tuple:
+    """
+    Build list of segments to keep/trim.
+    
+    v0.8.1: Edge silences (leading/trailing) are handled specially:
+      - Leading silence (pause at start): trimmed to EDGE_SILENCE_KEEP_MS
+      - Trailing silence (pause at end): trimmed to EDGE_SILENCE_KEEP_MS
+      - Mid-speech pauses: use style-based trim_rules (unchanged)
+    
+    Returns:
+        (segments, edge_info) tuple
+    """
     segments = []
     last_end = 0.0
     
+    # Identify leading and trailing silences (if any)
+    leading_silence = None
+    trailing_silence = None
+    
+    if silences:
+        # Leading: pause starts at or very near 0
+        if silences[0]["start"] <= EDGE_TOLERANCE and silences[0]["duration_ms"] > EDGE_SILENCE_MIN_MS:
+            leading_silence = silences[0]
+        
+        # Trailing: pause ends at or very near duration
+        # Don't double-count if same silence is both leading and trailing (very short edge case)
+        if silences[-1]["end"] >= duration - EDGE_TOLERANCE and silences[-1]["duration_ms"] > EDGE_SILENCE_MIN_MS:
+            if silences[-1] is not leading_silence:
+                trailing_silence = silences[-1]
+    
+    edge_info = {
+        "leading_trimmed_ms": 0,
+        "trailing_trimmed_ms": 0,
+        "leading_detected": leading_silence is not None,
+        "trailing_detected": trailing_silence is not None
+    }
+    
+    # Handle leading silence: start speech after leading silence (keep EDGE_SILENCE_KEEP_MS buffer)
+    if leading_silence is not None:
+        keep_seconds = EDGE_SILENCE_KEEP_MS / 1000
+        last_end = max(0, leading_silence["end"] - keep_seconds)
+        edge_info["leading_trimmed_ms"] = leading_silence["duration_ms"] - EDGE_SILENCE_KEEP_MS
+    
+    # Process mid-speech silences with style rules (skip edges - handled separately)
     for s in silences:
+        if s is leading_silence or s is trailing_silence:
+            continue
+        
         cap_ms = trim_rules.get(s["category"])
         
         if cap_ms is None or s["duration_ms"] <= cap_ms:
@@ -385,19 +439,41 @@ def build_segments_from_silences(duration: float, silences: list, trim_rules: di
             segments.append(("silence", s["start"], s["start"] + cap_ms / 1000))
             last_end = s["end"]
     
-    if last_end < duration:
-        segments.append(("speech", last_end, duration))
-    elif not segments:
+    # Handle trailing silence: cut before it, keep small buffer for natural fade
+    if trailing_silence is not None:
+        speech_end = trailing_silence["start"] + (EDGE_SILENCE_KEEP_MS / 1000)
+        if speech_end > last_end:
+            segments.append(("speech", last_end, speech_end))
+        edge_info["trailing_trimmed_ms"] = trailing_silence["duration_ms"] - EDGE_SILENCE_KEEP_MS
+    else:
+        # No trailing silence - keep rest of audio
+        if last_end < duration:
+            segments.append(("speech", last_end, duration))
+    
+    # Safety fallback
+    if not segments:
         segments.append(("speech", 0, duration))
     
-    return segments
+    return segments, edge_info
 
 
 def apply_silence_trim(input_path: Path, output_path: Path, segments: list) -> tuple:
     """Apply selective silence trimming using filter_complex."""
+    # Single-segment case
     if len(segments) == 1 and segments[0][0] == "speech":
-        shutil.copy(input_path, output_path)
-        return 0, ""
+        seg_type, seg_start, seg_end = segments[0]
+        input_duration = get_duration(input_path)
+        # If covers whole file, just copy
+        if seg_start <= 0.01 and seg_end >= input_duration - 0.01:
+            shutil.copy(input_path, output_path)
+            return 0, ""
+        # Otherwise trim to the subset (handles edge-only trimming cases)
+        return run_ffmpeg([
+            "-i", str(input_path),
+            "-af", f"atrim=start={seg_start:.3f}:end={seg_end:.3f},asetpts=PTS-STARTPTS",
+            "-ar", "44100", "-ac", "2", "-b:a", "192k",
+            str(output_path)
+        ])
     
     filter_parts = []
     concat_inputs = []
@@ -450,15 +526,11 @@ def apply_atempo(input_path: Path, output_path: Path, tempo: float) -> tuple:
 def apply_symmetric_padding(input_path: Path, output_path: Path, target_duration: float) -> tuple:
     """
     Pad audio symmetrically with silence to reach exact target duration.
-    
-    Example: content 2.6s, target 4.0s → 0.7s silence + 2.6s content + 0.7s silence = 4.0s
-    
-    Uses adelay (front) + apad (back) filters, with hard -t cap for exact duration.
+    Example: content 2.6s, target 4.0s -> 0.7s silence + 2.6s content + 0.7s silence = 4.0s
     """
     current_duration = get_duration(input_path)
     
     if current_duration >= target_duration:
-        # Already at or above target - no padding needed, just copy
         shutil.copy(input_path, output_path)
         return 0, ""
     
@@ -467,9 +539,6 @@ def apply_symmetric_padding(input_path: Path, output_path: Path, target_duration
     pad_front_ms = int(half_padding * 1000)
     pad_back_seconds = half_padding
     
-    # adelay=N|N works for both mono and stereo (extra channel values ignored)
-    # apad with pad_dur adds silence at the end
-    # -t caps exact duration to handle any float rounding
     return run_ffmpeg([
         "-i", str(input_path),
         "-af", f"adelay={pad_front_ms}|{pad_front_ms},apad=pad_dur={pad_back_seconds:.3f}",
@@ -480,21 +549,13 @@ def apply_symmetric_padding(input_path: Path, output_path: Path, target_duration
 
 
 def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[float] = None) -> dict:
-    """
-    Full optimization pipeline: analyze + context-aware execution + optional symmetric padding.
-    
-    Args:
-        input_path: Source audio file
-        job_id: Unique job identifier for temp files
-        pad_to_duration: If provided, pad final output symmetrically to exact target duration
-    """
+    """Full optimization pipeline: analyze + context-aware execution + optional symmetric padding."""
     # STEP 1: Analyze
     analysis = analyze_audio(input_path)
     duration = analysis["duration"]
     style = analysis["speech"]["style"]
     silences = analysis["pauses"]["all_pauses"]
     
-    # Track padding info for response
     padding_info = {
         "requested": pad_to_duration is not None,
         "target_duration": pad_to_duration,
@@ -503,12 +564,11 @@ def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[floa
         "pad_back_ms": 0
     }
     
-    # STEP 2: Check if already under target (passthrough path)
+    # STEP 2: Short file passthrough path
     if duration <= SOFT_TARGET:
         passthrough_path = WORK_DIR / f"{job_id}_passthrough.mp3"
         shutil.copy(input_path, passthrough_path)
         
-        # Apply padding if requested
         if pad_to_duration is not None and duration < pad_to_duration:
             padded_path = WORK_DIR / f"{job_id}_padded.mp3"
             ret, err = apply_symmetric_padding(passthrough_path, padded_path, pad_to_duration)
@@ -541,7 +601,13 @@ def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[floa
                 "silence_applied": False,
                 "atempo_applied": 1.0,
                 "silence_savings_ms": 0,
-                "atempo_savings_ms": 0
+                "atempo_savings_ms": 0,
+                "edge_info": {
+                    "leading_trimmed_ms": 0,
+                    "trailing_trimmed_ms": 0,
+                    "leading_detected": False,
+                    "trailing_detected": False
+                }
             },
             "padding": padding_info,
             "original_duration": round(duration, 3),
@@ -554,9 +620,9 @@ def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[floa
             "size_bytes": len(audio_bytes)
         }
     
-    # STEP 3: Apply silence trimming
+    # STEP 3: Apply silence trimming (v0.8.1 - includes edge silence auto-trim)
     trim_rules = get_trim_rules(style)
-    segments = build_segments_from_silences(duration, silences, trim_rules)
+    segments, edge_info = build_segments_from_silences(duration, silences, trim_rules)
     
     silence_path = WORK_DIR / f"{job_id}_silence.mp3"
     ret, err = apply_silence_trim(input_path, silence_path, segments)
@@ -567,12 +633,13 @@ def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[floa
     after_silence_duration = get_duration(silence_path)
     silence_savings_ms = round((duration - after_silence_duration) * 1000)
     
-    # STEP 4: Decide atempo
+    # STEP 4: Decide atempo (with 2% safety margin for ffmpeg approximation)
     atempo_applied = 1.0
     optimized_path = WORK_DIR / f"{job_id}_optimized.mp3"
     
     if after_silence_duration > HARD_CAP:
-        required = after_silence_duration / HARD_CAP
+        # 2% safety margin: ffmpeg atempo actual output is ~1-2% off from mathematical target
+        required = (after_silence_duration / HARD_CAP) * 1.02
         ideal = after_silence_duration / SOFT_TARGET
         
         if required <= ATEMPO_MAX:
@@ -606,7 +673,7 @@ def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[floa
     content_duration = get_duration(optimized_path)
     atempo_savings_ms = round((after_silence_duration - content_duration) * 1000) if atempo_applied > 1.0 else 0
     
-    # STEP 5: Apply symmetric padding (v0.8 NEW)
+    # STEP 5: Apply symmetric padding (v0.8)
     if pad_to_duration is not None and content_duration < pad_to_duration:
         padded_path = WORK_DIR / f"{job_id}_padded.mp3"
         ret, err = apply_symmetric_padding(optimized_path, padded_path, pad_to_duration)
@@ -648,7 +715,8 @@ def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[floa
             "atempo_savings_ms": atempo_savings_ms,
             "trim_rules_used": trim_rules,
             "style_atempo_cap": round(get_style_atempo_cap(style), 3),
-            "segments_count": len(segments)
+            "segments_count": len(segments),
+            "edge_info": edge_info
         },
         "padding": padding_info,
         "original_duration": round(duration, 3),
@@ -738,7 +806,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.8.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.8.1", "status": "running"}
 
 
 @app.get("/health")
@@ -826,20 +894,23 @@ async def optimize_endpoint(
       - Soft target: 3.0s (ideal)
       - Hard cap:    4.0s (absolute, never exceeded)
     
-    Logic:
+    Logic (v0.8.1):
       1. Analyze audio (volume, silence, speech density, style)
-      2. Apply selective silence trimming based on style + pause categories
-      3. Apply atempo (style-scaled between target/cap; emergency up to 1.20 if needed)
-      4. [v0.8 NEW] If pad_to_duration is set, pad symmetrically with silence to reach
-         exact target duration. Example: content 2.6s + pad_to_duration=4.0 →
-         0.7s silence + 2.6s content + 0.7s silence = 4.0s total.
-      5. Return optimized audio + full analysis + execution details + padding info
+      2. Edge silence trim (leading + trailing silence always trimmed)
+      3. Mid-speech silence trim (style-aware caps)
+      4. Atempo (style-scaled; 2% safety margin for ffmpeg approximation)
+      5. Optional: symmetric padding to reach exact target duration
     
     Form params:
       file:               MP3 file to optimize (required)
-      pad_to_duration:    Optional. Float, 0.5-15.0s. If set, pads final audio
-                          symmetrically to reach exact duration. Helps Seedance render
-                          full video duration with complete voice delivery.
+      pad_to_duration:    Optional. Float, 0.5-15.0s. Pads final audio symmetrically
+                          to reach exact duration. Helps Seedance render full video
+                          duration with complete voice delivery.
+    
+    Edge silence trim (v0.8.1):
+      - Leading silence (pause within 50ms of start): trimmed to 50ms keep
+      - Trailing silence (pause within 50ms of end): trimmed to 50ms keep
+      - Mid-speech pauses: use style-based rules (preserves breath rhythm)
     
     Atempo caps:
       - Fast speaker:   1.08 (gentle, preserves dense delivery)
@@ -849,7 +920,6 @@ async def optimize_endpoint(
     """
     start_time = time.time()
     
-    # Validate pad_to_duration if provided
     if pad_to_duration is not None:
         if pad_to_duration < PAD_TO_DURATION_MIN or pad_to_duration > PAD_TO_DURATION_MAX:
             raise HTTPException(
