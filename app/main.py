@@ -917,6 +917,7 @@ UGC_PROFILES = {
         "target_final_duration": 3.0,
         "target_density": 0.85,
         "max_pause_ms": 250,
+        "min_speedup": 1.07,
         "max_speedup": 1.15,
     },
 }
@@ -985,26 +986,37 @@ def decide_video_optimization(analysis: dict, duration: float, profile: dict) ->
     duration_ratio = trimmed_duration / target_duration
     
     # Classify delivery
-    if trimmed_density < target_density * 0.90 or duration_ratio > 1.15:
+    # too_slow if EITHER density is below target OR duration is above target
+    if trimmed_density < target_density * 0.95 or duration_ratio > 1.05:
         classification = "too_slow"
     elif duration_ratio < 0.85 and trimmed_density > target_density * 1.05:
         classification = "too_fast"
     else:
         classification = "good"
     
-    # Calculate speedup
-    speedup = 1.0
-    speedup_reason = "already in target range"
+    # Calculate speedup (ALWAYS apply at least min_speedup unless too_fast)
+    min_speedup_val = profile.get("min_speedup", 1.0)
+    max_speedup_val = profile["max_speedup"]
     
-    if classification == "too_slow" and trimmed_duration > target_duration:
-        ideal_speedup = trimmed_duration / target_duration
-        speedup = min(ideal_speedup, profile["max_speedup"])
-        speedup = round(speedup, 3)
-        speedup_reason = f"speeding up from {trimmed_duration:.2f}s toward {target_duration:.2f}s target"
-    elif classification == "too_slow":
-        # Slow but already short enough - minimal speedup
+    if classification == "too_fast":
+        # Never speed up an already-fast file
         speedup = 1.0
-        speedup_reason = "slow pace but duration already acceptable"
+        speedup_reason = "already fast enough, no speedup applied"
+    elif classification == "too_slow":
+        # Calculate ideal speedup to hit target, cap at max
+        if trimmed_duration > target_duration:
+            ideal_speedup = trimmed_duration / target_duration
+            speedup = min(ideal_speedup, max_speedup_val)
+        else:
+            speedup = max_speedup_val
+        # But never less than min
+        speedup = max(speedup, min_speedup_val)
+        speedup = round(speedup, 3)
+        speedup_reason = f"too_slow: speeding up from {trimmed_duration:.2f}s toward {target_duration:.2f}s"
+    else:
+        # "good" classification - apply min_speedup for consistent UGC pace
+        speedup = round(min_speedup_val, 3)
+        speedup_reason = f"baseline boost {min_speedup_val}x for UGC pace"
     
     final_duration = trimmed_duration / speedup if speedup > 1.0 else trimmed_duration
     
@@ -1213,6 +1225,7 @@ async def video_speedup_endpoint(
 async def video_optimize_endpoint(
     file: UploadFile = File(...),
     target_duration: Optional[float] = Form(None),
+    min_speedup: Optional[float] = Form(None),
     max_speedup: Optional[float] = Form(None),
     apply_trim: bool = Form(True),
     apply_speedup: bool = Form(True),
@@ -1224,25 +1237,34 @@ async def video_optimize_endpoint(
     Logic (v0.9):
       1. Extract audio, run full analysis
       2. Calculate optimal trim boundaries + speedup based on UGC profile
-      3. Apply: trim edges, then speedup if still too slow
+      3. Apply: trim edges, then speedup (always at least min_speedup)
       4. Return optimized video + decision details
     
     Default profile:
       - target_final_duration: 3.0s
       - target_density: 0.85
-      - max_speedup: 1.15x
+      - min_speedup: 1.07x (always applied for UGC pace)
+      - max_speedup: 1.15x (cap for too_slow files)
       - max_pause_ms: 250
+    
+    Speedup logic:
+      - too_slow:  between min_speedup and max_speedup (based on duration)
+      - good:      min_speedup baseline (for consistent UGC pace)
+      - too_fast:  no speedup (1.0x)
     
     Form params:
       file:              Video file (MP4)
       target_duration:   Optional override for target duration
+      min_speedup:       Optional override for baseline speedup
       max_speedup:       Optional override for max speedup cap
       apply_trim:        If True, trim leading/trailing silence (default: True)
-      apply_speedup:     If True, apply speedup if classified too_slow (default: True)
+      apply_speedup:     If True, apply speedup (default: True)
     """
     profile_settings = dict(UGC_PROFILES["default"])
     if target_duration is not None:
         profile_settings["target_final_duration"] = target_duration
+    if min_speedup is not None:
+        profile_settings["min_speedup"] = min_speedup
     if max_speedup is not None:
         profile_settings["max_speedup"] = max_speedup
     
