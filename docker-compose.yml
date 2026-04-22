@@ -1,0 +1,8 @@
+services:
+  ffmpeg:
+    build: .
+    restart: unless-stopped
+    environment:
+      - API_TOKEN=${API_TOKEN}
+    ports:
+      - "8000"
