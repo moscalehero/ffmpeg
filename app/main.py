@@ -1,11 +1,18 @@
 """
-FFmpeg HTTP Service v0.2
-FastAPI wrapper around ffmpeg for audio/video processing.
+FFmpeg HTTP Service v0.3
+Clean audio cutting at exact timestamps.
 
 Endpoints:
+  GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
   POST /audio/cut-scenes    - Cut multiple scenes from a single audio file
+
+Changelog v0.3:
+  - Removed silence removal (word-level timestamps are already precise)
+  - Removed two-pass processing
+  - Simpler + faster (single ffmpeg call per scene)
+  - Keeps small fade in/out (30ms) for clean cut edges
 """
 
 import subprocess
@@ -19,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.2.0")
+app = FastAPI(title="FFmpeg Service", version="0.3.0")
 
 # ============================================
 # CONFIG
@@ -66,14 +73,13 @@ def cut_scene(
     scene: dict,
     job_id: str,
     padding: float = 0.05,
-    silence_threshold_db: float = -35.0,
-    min_silence_duration: float = 0.4,
-    max_silence_duration: float = 0.3,
     fade: float = 0.03
 ) -> dict:
     """
-    Cut a single scene from input audio with silence removal and fades.
-    Returns dict with scene data + base64 audio.
+    Cut a scene from input audio at exact timestamps.
+    
+    No silence removal - ElevenLabs word-level timestamps are already precise.
+    Only adds small padding + fade in/out for clean cut edges (no clicks).
     """
     part = scene.get("part", "unknown")
     start = float(scene["start"])
@@ -82,29 +88,24 @@ def cut_scene(
 
     output_path = WORK_DIR / f"{job_id}_part_{part}.mp3"
 
-    # Compute padded start/end
+    # Cut boundaries with small padding for breathing room
     seg_start = max(0, start - padding)
     seg_end = end + padding
+    seg_duration = seg_end - seg_start
 
-    # Silence removal: pauses >= min_silence_duration get capped to max_silence_duration
-    # Uses silenceremove filter with stop_periods=-1 (all internal silences)
-    silence_filter = (
-        f"silenceremove="
-        f"start_periods=0:"
-        f"stop_periods=-1:"
-        f"stop_duration={max_silence_duration}:"
-        f"stop_threshold={silence_threshold_db}dB"
+    # Fade in/out for clean cut edges (no clicks/pops)
+    fade_out_start = max(0, seg_duration - fade)
+    audio_filter = (
+        f"afade=in:st=0:d={fade},"
+        f"afade=out:st={fade_out_start:.3f}:d={fade}"
     )
 
-    # We need to know the duration AFTER silence removal to set afade out correctly
-    # Two-pass approach: cut first, then apply fades
-
-    # PASS 1: Cut + silence removal
+    # Single ffmpeg pass: cut + fade
     ret, err = run_ffmpeg([
         "-i", str(input_path),
         "-ss", f"{seg_start:.3f}",
         "-to", f"{seg_end:.3f}",
-        "-af", silence_filter,
+        "-af", audio_filter,
         "-ar", "44100", "-ac", "2", "-b:a", "192k",
         str(output_path)
     ])
@@ -113,29 +114,8 @@ def cut_scene(
         return {
             "part": part,
             "status": "error",
-            "error": f"ffmpeg cut failed: {err[:200]}"
+            "error": f"ffmpeg failed: {err[:200]}"
         }
-
-    # Get duration after silence removal
-    duration_after_cut = get_duration(output_path)
-
-    # PASS 2: Apply fade in/out (overwrite same file via temp)
-    if duration_after_cut > 2 * fade:
-        fade_out_start = duration_after_cut - fade
-        fade_filter = f"afade=in:st=0:d={fade},afade=out:st={fade_out_start:.3f}:d={fade}"
-
-        temp_path = WORK_DIR / f"{job_id}_part_{part}_faded.mp3"
-        ret, err = run_ffmpeg([
-            "-i", str(output_path),
-            "-af", fade_filter,
-            "-ar", "44100", "-ac", "2", "-b:a", "192k",
-            str(temp_path)
-        ])
-
-        if ret == 0:
-            # Swap files
-            output_path.unlink(missing_ok=True)
-            temp_path.rename(output_path)
 
     final_duration = get_duration(output_path)
 
@@ -152,7 +132,8 @@ def cut_scene(
         "status": "ok",
         "original_duration": round(original_duration, 3),
         "final_duration": round(final_duration, 3),
-        "silence_removed_ms": round((original_duration - final_duration) * 1000),
+        "padding_added_ms": round(padding * 2 * 1000),
+        "fade_ms": round(fade * 1000),
         "audio_base64": audio_base64,
         "size_bytes": len(audio_bytes)
     }
@@ -163,7 +144,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.2.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.3.0", "status": "running"}
 
 
 @app.get("/health")
@@ -188,14 +169,11 @@ async def cut_scenes(
     file: UploadFile = File(...),
     scenes: str = Form(...),
     padding: float = Form(0.05),
-    silence_threshold_db: float = Form(-35.0),
-    min_silence_duration: float = Form(0.4),
-    max_silence_duration: float = Form(0.3),
     fade: float = Form(0.03),
     auth: str = Depends(verify_token)
 ):
     """
-    Cut multiple scenes from a single combined audio file.
+    Cut multiple scenes from a single audio file at exact timestamps.
 
     Input:
       file: combined audio (mp3/wav) as multipart upload
@@ -203,11 +181,8 @@ async def cut_scenes(
         [{"part": "1", "start": 0.0, "end": 2.612}, ...]
 
     Optional params:
-      padding: buffer around each cut (default 0.05s = 50ms)
-      silence_threshold_db: silence detection threshold (default -35dB)
-      min_silence_duration: min pause length to trim (default 0.4s)
-      max_silence_duration: cap long pauses to this (default 0.3s)
-      fade: fade in/out duration (default 0.03s = 30ms)
+      padding: buffer around each cut in seconds (default 0.05 = 50ms)
+      fade: fade in/out duration in seconds (default 0.03 = 30ms)
 
     Returns:
       JSON with cut scenes as base64-encoded MP3s
@@ -246,9 +221,6 @@ async def cut_scenes(
                     scene,
                     job_id,
                     padding,
-                    silence_threshold_db,
-                    min_silence_duration,
-                    max_silence_duration,
                     fade
                 )
                 for scene in scenes_list
@@ -257,7 +229,6 @@ async def cut_scenes(
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        # Count success/failure
         success_count = sum(1 for r in results if r.get("status") == "ok")
         error_count = sum(1 for r in results if r.get("status") == "error")
 
@@ -271,5 +242,4 @@ async def cut_scenes(
         }
 
     finally:
-        # Cleanup input
         input_path.unlink(missing_ok=True)
