@@ -1,6 +1,6 @@
 """
-FFmpeg HTTP Service v0.3
-Clean audio cutting at exact timestamps.
+FFmpeg HTTP Service v0.4
+Clean audio cutting at exact timestamps with frame-accurate seeking.
 
 Endpoints:
   GET  /                    - Service info
@@ -8,11 +8,15 @@ Endpoints:
   GET  /auth-test           - Auth verification
   POST /audio/cut-scenes    - Cut multiple scenes from a single audio file
 
+Changelog v0.4:
+  - Added -accurate_seek flag for frame-accurate cutting
+  - Two-pass approach: cut first, then apply fades
+  - Fixes issue where scenes had missing voice due to imprecise seeking
+  - afade filter no longer applied during cut (was corrupting timing)
+
 Changelog v0.3:
-  - Removed silence removal (word-level timestamps are already precise)
-  - Removed two-pass processing
-  - Simpler + faster (single ffmpeg call per scene)
-  - Keeps small fade in/out (30ms) for clean cut edges
+  - Removed silence removal (word-level timestamps already precise)
+  - Simplified single-pass cutting
 """
 
 import subprocess
@@ -26,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.3.0")
+app = FastAPI(title="FFmpeg Service", version="0.4.0")
 
 # ============================================
 # CONFIG
@@ -78,53 +82,83 @@ def cut_scene(
     """
     Cut a scene from input audio at exact timestamps.
     
-    No silence removal - ElevenLabs word-level timestamps are already precise.
-    Only adds small padding + fade in/out for clean cut edges (no clicks).
+    Two-pass approach for frame-accurate cutting:
+    1. Cut with -accurate_seek + re-encode (precise audio boundaries)
+    2. Apply fade in/out on the cut file
+    
+    This prevents timing issues where the afade filter's timestamps get
+    confused by the -ss offset during a single-pass cut.
     """
     part = scene.get("part", "unknown")
     start = float(scene["start"])
     end = float(scene["end"])
     original_duration = end - start
 
+    cut_path = WORK_DIR / f"{job_id}_cut_{part}.mp3"
     output_path = WORK_DIR / f"{job_id}_part_{part}.mp3"
 
     # Cut boundaries with small padding for breathing room
     seg_start = max(0, start - padding)
     seg_end = end + padding
-    seg_duration = seg_end - seg_start
 
-    # Fade in/out for clean cut edges (no clicks/pops)
-    fade_out_start = max(0, seg_duration - fade)
-    audio_filter = (
-        f"afade=in:st=0:d={fade},"
-        f"afade=out:st={fade_out_start:.3f}:d={fade}"
-    )
-
-    # Single ffmpeg pass: cut + fade
+    # STEP 1: Accurate cut (re-encode for precise audio start/end)
+    # -accurate_seek forces precise seeking instead of keyframe-based
+    # -ss/-to AFTER -i = decode-then-seek (frame accurate, slower but precise)
     ret, err = run_ffmpeg([
+        "-accurate_seek",
         "-i", str(input_path),
         "-ss", f"{seg_start:.3f}",
         "-to", f"{seg_end:.3f}",
-        "-af", audio_filter,
         "-ar", "44100", "-ac", "2", "-b:a", "192k",
-        str(output_path)
+        str(cut_path)
     ])
 
     if ret != 0:
         return {
             "part": part,
             "status": "error",
-            "error": f"ffmpeg failed: {err[:200]}"
+            "error": f"ffmpeg cut failed: {err[:200]}"
         }
+
+    # STEP 2: Apply fade in/out on the cleanly cut file
+    cut_duration = get_duration(cut_path)
+    
+    # Safety check: don't apply fade if file is too short
+    if cut_duration < 2 * fade:
+        # Skip fade, just rename
+        cut_path.rename(output_path)
+    else:
+        fade_out_start = cut_duration - fade
+        audio_filter = (
+            f"afade=in:st=0:d={fade},"
+            f"afade=out:st={fade_out_start:.3f}:d={fade}"
+        )
+
+        ret, err = run_ffmpeg([
+            "-i", str(cut_path),
+            "-af", audio_filter,
+            "-ar", "44100", "-ac", "2", "-b:a", "192k",
+            str(output_path)
+        ])
+
+        # Cleanup intermediate file
+        cut_path.unlink(missing_ok=True)
+
+        if ret != 0:
+            return {
+                "part": part,
+                "status": "error",
+                "error": f"ffmpeg fade failed: {err[:200]}"
+            }
 
     final_duration = get_duration(output_path)
 
-    # Read + encode
+    # Read + encode as base64
     with open(output_path, "rb") as f:
         audio_bytes = f.read()
     audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-    # Cleanup
+    # Cleanup output
     output_path.unlink(missing_ok=True)
 
     return {
@@ -144,7 +178,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.3.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.4.0", "status": "running"}
 
 
 @app.get("/health")
@@ -174,6 +208,9 @@ async def cut_scenes(
 ):
     """
     Cut multiple scenes from a single audio file at exact timestamps.
+
+    Uses frame-accurate seeking (-accurate_seek + decode-then-seek)
+    to ensure precise cuts at word boundaries.
 
     Input:
       file: combined audio (mp3/wav) as multipart upload
