@@ -1,32 +1,27 @@
 """
-FFmpeg HTTP Service v0.7
-Smart audio cutting + context-aware optimization for UGC ad pipeline.
+FFmpeg HTTP Service v0.8
+Smart audio cutting + context-aware optimization + symmetric padding for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
-  POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s)
+  POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, optional symmetric padding)
+
+Changelog v0.8:
+  - NEW: Symmetric padding feature for Seedance video generation
+  - Optional form param `pad_to_duration` (float, 0.5-15.0s) on /audio/optimize
+  - When set, pads audio symmetrically (front + back silence) to reach exact target duration
+  - Example: content 2.6s + pad_to_duration 4.0s → 0.7s silence + 2.6s content + 0.7s silence = 4.0s
+  - Helps Seedance render full video duration with complete voice delivery
+  - Silence is inserted BEFORE optimization result (not on original)
+  - No-op if audio is already >= target duration
 
 Changelog v0.7:
-  - Removed /audio/analyze endpoint (analysis is bundled inside /audio/optimize)
-  - Style-scaled atempo caps:
-      Fast speaker:   atempo max 1.08 (gentle, preserve density)
-      Normal speaker: atempo max 1.12
-      Slow speaker:   atempo max 1.15
-  - Atempo now applied to all styles between soft target and hard cap
-  - Better results for fast speakers above 3.0s (no more 0 savings)
-
-Changelog v0.6:
-  - Added /audio/analyze + context-aware /audio/optimize
-  - Adaptive silence threshold, speech style classification
-  - Pause categorization (micro/short/medium/long/very_long)
-  - Selective pause trimming (cap instead of kill)
-  - Hard cap 4.0s, emergency atempo up to 1.20
-
-Changelog v0.4:
-  - Accurate seeking + two-pass cut
+  - Removed /audio/analyze endpoint (analysis bundled inside /audio/optimize)
+  - Style-scaled atempo caps: Fast 1.08, Normal 1.12, Slow 1.15
+  - Atempo applied to all styles between soft target and hard cap
 """
 
 import subprocess
@@ -38,11 +33,12 @@ import time
 import re
 import shutil
 from pathlib import Path
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.7.0")
+app = FastAPI(title="FFmpeg Service", version="0.8.0")
 
 # ============================================
 # CONFIG
@@ -56,29 +52,32 @@ SOFT_TARGET = 3.0          # ideal duration
 HARD_CAP = 4.0             # absolute max (never exceed)
 
 # Atempo limits
-ATEMPO_MAX = 1.15          # normal max
-ATEMPO_EMERGENCY = 1.20    # only for extreme cases (>5s input)
+ATEMPO_MAX = 1.15
+ATEMPO_EMERGENCY = 1.20
 
 # Style-scaled atempo caps (for duration between SOFT_TARGET and HARD_CAP)
-ATEMPO_CAP_FAST = 1.08     # fast speakers: gentle atempo to preserve density
+ATEMPO_CAP_FAST = 1.08
 ATEMPO_CAP_NORMAL = 1.12
 ATEMPO_CAP_SLOW = 1.15
 
 # Silence detection
-SILENCE_RELATIVE_DB = 20   # adaptive: mean_volume - this = silence threshold
-SILENCE_FALLBACK_DB = -35  # if mean_volume detection fails
-MIN_PAUSE_DETECT_MS = 80   # ignore anything shorter than this
+SILENCE_RELATIVE_DB = 20
+SILENCE_FALLBACK_DB = -35
+MIN_PAUSE_DETECT_MS = 80
 
 # Pause categorization (milliseconds)
-PAUSE_MICRO_MAX = 180       # 80-180ms
-PAUSE_SHORT_MAX = 300       # 180-300ms
-PAUSE_MEDIUM_MAX = 500      # 300-500ms
-PAUSE_LONG_MAX = 800        # 500-800ms
-# >800ms = very_long
+PAUSE_MICRO_MAX = 180
+PAUSE_SHORT_MAX = 300
+PAUSE_MEDIUM_MAX = 500
+PAUSE_LONG_MAX = 800
 
 # Speech density thresholds
 DENSITY_FAST = 0.85
 DENSITY_NORMAL = 0.70
+
+# Padding limits (v0.8)
+PAD_TO_DURATION_MIN = 0.5
+PAD_TO_DURATION_MAX = 15.0
 
 security = HTTPBearer()
 
@@ -203,7 +202,7 @@ def classify_speech_style(density: float) -> tuple:
 
 
 def get_style_atempo_cap(style: str) -> float:
-    """Get atempo cap based on speech style (for gentle tempo adjustments)."""
+    """Get atempo cap based on speech style."""
     if style == "fast":
         return ATEMPO_CAP_FAST
     elif style == "normal":
@@ -217,7 +216,6 @@ def analyze_audio(input_path: Path) -> dict:
     duration = get_duration(input_path)
     volume = detect_volume(input_path)
     
-    # Adaptive silence threshold
     if volume["mean_db"] is not None:
         silence_threshold_db = volume["mean_db"] - SILENCE_RELATIVE_DB
     else:
@@ -229,24 +227,20 @@ def analyze_audio(input_path: Path) -> dict:
         min_duration=MIN_PAUSE_DETECT_MS / 1000
     )
     
-    # Enrich silences with duration_ms + category
     for s in silences:
         s["duration_ms"] = round(s["duration"] * 1000)
         s["category"] = categorize_pause(s["duration_ms"])
     
-    # Calculate speech metrics
     total_silence = sum(s["duration"] for s in silences)
     active_speech = max(0, duration - total_silence)
     speech_density = active_speech / duration if duration > 0 else 0
     
     style, style_reasoning = classify_speech_style(speech_density)
     
-    # Pause distribution
     distribution = {"micro": 0, "short": 0, "medium": 0, "long": 0, "very_long": 0}
     for s in silences:
         distribution[s["category"]] += 1
     
-    # Pause stats
     durations_ms = [s["duration_ms"] for s in silences]
     pause_stats = {
         "count": len(silences),
@@ -290,27 +284,18 @@ def get_trim_rules(style: str) -> dict:
     """Get pause trim caps based on speech style (in ms)."""
     if style == "fast":
         return {
-            "micro": None,      # keep
-            "short": None,      # keep
-            "medium": None,     # keep (dramatic beats)
-            "long": 300,
-            "very_long": 350
+            "micro": None, "short": None, "medium": None,
+            "long": 300, "very_long": 350
         }
     elif style == "normal":
         return {
-            "micro": None,
-            "short": None,
-            "medium": 250,
-            "long": 200,
-            "very_long": 250
+            "micro": None, "short": None, "medium": 250,
+            "long": 200, "very_long": 250
         }
     else:  # slow
         return {
-            "micro": None,
-            "short": 180,
-            "medium": 180,
-            "long": 150,
-            "very_long": 200
+            "micro": None, "short": 180, "medium": 180,
+            "long": 150, "very_long": 200
         }
 
 
@@ -343,15 +328,12 @@ def generate_recommendation(duration: float, style: str, silences: list, speech_
     style_cap = get_style_atempo_cap(style)
     
     if delta_to_cap <= 0:
-        # Silence alone gets us under cap
         if delta_to_target <= 0:
             estimated_atempo = 1.0
         else:
-            # Between target and cap - use style-scaled atempo
             ideal = after_silence_s / SOFT_TARGET
             estimated_atempo = min(ideal, style_cap)
     else:
-        # Need atempo to hit cap
         required = after_silence_s / HARD_CAP
         ideal = after_silence_s / SOFT_TARGET
         
@@ -366,12 +348,7 @@ def generate_recommendation(duration: float, style: str, silences: list, speech_
     hit_target = estimated_final <= SOFT_TARGET + 0.1
     hit_cap = estimated_final <= HARD_CAP + 0.05
     
-    if hit_target:
-        feasibility = "easy"
-    elif hit_cap:
-        feasibility = "moderate"
-    else:
-        feasibility = "hard"
+    feasibility = "easy" if hit_target else ("moderate" if hit_cap else "hard")
     
     return {
         "needs_optimization": True,
@@ -435,7 +412,7 @@ def apply_silence_trim(input_path: Path, output_path: Path, segments: list) -> t
                 f"[0:a]atrim=start={seg_start:.3f}:end={seg_end:.3f},"
                 f"asetpts=PTS-STARTPTS[a{i}]"
             )
-        else:  # silence
+        else:
             filter_parts.append(
                 f"anullsrc=r=44100:cl=stereo:d={duration:.3f}[a{i}]"
             )
@@ -470,21 +447,95 @@ def apply_atempo(input_path: Path, output_path: Path, tempo: float) -> tuple:
     ])
 
 
-def optimize_audio(input_path: Path, job_id: str) -> dict:
-    """Full optimization pipeline: analyze + context-aware execution."""
+def apply_symmetric_padding(input_path: Path, output_path: Path, target_duration: float) -> tuple:
+    """
+    Pad audio symmetrically with silence to reach exact target duration.
+    
+    Example: content 2.6s, target 4.0s → 0.7s silence + 2.6s content + 0.7s silence = 4.0s
+    
+    Uses adelay (front) + apad (back) filters, with hard -t cap for exact duration.
+    """
+    current_duration = get_duration(input_path)
+    
+    if current_duration >= target_duration:
+        # Already at or above target - no padding needed, just copy
+        shutil.copy(input_path, output_path)
+        return 0, ""
+    
+    total_padding = target_duration - current_duration
+    half_padding = total_padding / 2
+    pad_front_ms = int(half_padding * 1000)
+    pad_back_seconds = half_padding
+    
+    # adelay=N|N works for both mono and stereo (extra channel values ignored)
+    # apad with pad_dur adds silence at the end
+    # -t caps exact duration to handle any float rounding
+    return run_ffmpeg([
+        "-i", str(input_path),
+        "-af", f"adelay={pad_front_ms}|{pad_front_ms},apad=pad_dur={pad_back_seconds:.3f}",
+        "-t", f"{target_duration:.3f}",
+        "-ar", "44100", "-ac", "2", "-b:a", "192k",
+        str(output_path)
+    ])
+
+
+def optimize_audio(input_path: Path, job_id: str, pad_to_duration: Optional[float] = None) -> dict:
+    """
+    Full optimization pipeline: analyze + context-aware execution + optional symmetric padding.
+    
+    Args:
+        input_path: Source audio file
+        job_id: Unique job identifier for temp files
+        pad_to_duration: If provided, pad final output symmetrically to exact target duration
+    """
     # STEP 1: Analyze
     analysis = analyze_audio(input_path)
     duration = analysis["duration"]
     style = analysis["speech"]["style"]
     silences = analysis["pauses"]["all_pauses"]
     
-    # STEP 2: Check if already under target
+    # Track padding info for response
+    padding_info = {
+        "requested": pad_to_duration is not None,
+        "target_duration": pad_to_duration,
+        "applied": False,
+        "pad_front_ms": 0,
+        "pad_back_ms": 0
+    }
+    
+    # STEP 2: Check if already under target (passthrough path)
     if duration <= SOFT_TARGET:
-        with open(input_path, "rb") as f:
+        passthrough_path = WORK_DIR / f"{job_id}_passthrough.mp3"
+        shutil.copy(input_path, passthrough_path)
+        
+        # Apply padding if requested
+        if pad_to_duration is not None and duration < pad_to_duration:
+            padded_path = WORK_DIR / f"{job_id}_padded.mp3"
+            ret, err = apply_symmetric_padding(passthrough_path, padded_path, pad_to_duration)
+            passthrough_path.unlink(missing_ok=True)
+            
+            if ret != 0:
+                padded_path.unlink(missing_ok=True)
+                return {"status": "error", "error": f"padding failed: {err[:200]}"}
+            
+            final_path = padded_path
+            total_padding = pad_to_duration - duration
+            half_padding = total_padding / 2
+            padding_info["applied"] = True
+            padding_info["pad_front_ms"] = round(half_padding * 1000)
+            padding_info["pad_back_ms"] = round(half_padding * 1000)
+            final_duration = get_duration(final_path)
+        else:
+            final_path = passthrough_path
+            final_duration = duration
+        
+        with open(final_path, "rb") as f:
             audio_bytes = f.read()
+        final_path.unlink(missing_ok=True)
+        
         return {
             "status": "ok",
-            "action": "passthrough",
+            "action": "passthrough" + ("_padded" if padding_info["applied"] else ""),
             "analysis": analysis,
             "execution": {
                 "silence_applied": False,
@@ -492,8 +543,10 @@ def optimize_audio(input_path: Path, job_id: str) -> dict:
                 "silence_savings_ms": 0,
                 "atempo_savings_ms": 0
             },
+            "padding": padding_info,
             "original_duration": round(duration, 3),
-            "final_duration": round(duration, 3),
+            "content_duration": round(duration, 3),
+            "final_duration": round(final_duration, 3),
             "total_savings_ms": 0,
             "hit_soft_target": True,
             "hit_hard_cap": True,
@@ -514,12 +567,11 @@ def optimize_audio(input_path: Path, job_id: str) -> dict:
     after_silence_duration = get_duration(silence_path)
     silence_savings_ms = round((duration - after_silence_duration) * 1000)
     
-    # STEP 4: Decide atempo (style-scaled when between target and cap)
+    # STEP 4: Decide atempo
     atempo_applied = 1.0
-    output_path = WORK_DIR / f"{job_id}_optimized.mp3"
+    optimized_path = WORK_DIR / f"{job_id}_optimized.mp3"
     
     if after_silence_duration > HARD_CAP:
-        # MUST use atempo to hit cap
         required = after_silence_duration / HARD_CAP
         ideal = after_silence_duration / SOFT_TARGET
         
@@ -530,40 +582,64 @@ def optimize_audio(input_path: Path, job_id: str) -> dict:
         
         atempo_applied = round(atempo_applied, 3)
         
-        ret, err = apply_atempo(silence_path, output_path, atempo_applied)
+        ret, err = apply_atempo(silence_path, optimized_path, atempo_applied)
         silence_path.unlink(missing_ok=True)
         if ret != 0:
             return {"status": "error", "error": f"atempo failed: {err[:200]}"}
     
     elif after_silence_duration > SOFT_TARGET:
-        # Between target and cap - apply gentle atempo scaled by style
         style_cap = get_style_atempo_cap(style)
         ideal = after_silence_duration / SOFT_TARGET
         atempo_applied = round(min(ideal, style_cap), 3)
         
         if atempo_applied > 1.02:
-            ret, err = apply_atempo(silence_path, output_path, atempo_applied)
+            ret, err = apply_atempo(silence_path, optimized_path, atempo_applied)
             silence_path.unlink(missing_ok=True)
             if ret != 0:
                 return {"status": "error", "error": f"atempo failed: {err[:200]}"}
         else:
             atempo_applied = 1.0
-            silence_path.rename(output_path)
+            silence_path.rename(optimized_path)
     else:
-        # Already at/under target after silence
-        silence_path.rename(output_path)
+        silence_path.rename(optimized_path)
     
-    final_duration = get_duration(output_path)
-    atempo_savings_ms = round((after_silence_duration - final_duration) * 1000) if atempo_applied > 1.0 else 0
+    content_duration = get_duration(optimized_path)
+    atempo_savings_ms = round((after_silence_duration - content_duration) * 1000) if atempo_applied > 1.0 else 0
     
-    with open(output_path, "rb") as f:
+    # STEP 5: Apply symmetric padding (v0.8 NEW)
+    if pad_to_duration is not None and content_duration < pad_to_duration:
+        padded_path = WORK_DIR / f"{job_id}_padded.mp3"
+        ret, err = apply_symmetric_padding(optimized_path, padded_path, pad_to_duration)
+        optimized_path.unlink(missing_ok=True)
+        
+        if ret != 0:
+            padded_path.unlink(missing_ok=True)
+            return {"status": "error", "error": f"padding failed: {err[:200]}"}
+        
+        total_padding = pad_to_duration - content_duration
+        half_padding = total_padding / 2
+        padding_info["applied"] = True
+        padding_info["pad_front_ms"] = round(half_padding * 1000)
+        padding_info["pad_back_ms"] = round(half_padding * 1000)
+        
+        final_path = padded_path
+    else:
+        final_path = optimized_path
+    
+    final_duration = get_duration(final_path)
+    
+    with open(final_path, "rb") as f:
         audio_bytes = f.read()
     audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-    output_path.unlink(missing_ok=True)
+    final_path.unlink(missing_ok=True)
+    
+    action = "optimized"
+    if padding_info["applied"]:
+        action += "_padded"
     
     return {
         "status": "ok",
-        "action": "optimized",
+        "action": action,
         "analysis": analysis,
         "execution": {
             "silence_applied": silence_savings_ms > 0,
@@ -574,12 +650,14 @@ def optimize_audio(input_path: Path, job_id: str) -> dict:
             "style_atempo_cap": round(get_style_atempo_cap(style), 3),
             "segments_count": len(segments)
         },
+        "padding": padding_info,
         "original_duration": round(duration, 3),
         "after_silence_duration": round(after_silence_duration, 3),
+        "content_duration": round(content_duration, 3),
         "final_duration": round(final_duration, 3),
-        "total_savings_ms": round((duration - final_duration) * 1000),
-        "hit_soft_target": final_duration <= SOFT_TARGET + 0.1,
-        "hit_hard_cap": final_duration <= HARD_CAP + 0.05,
+        "total_savings_ms": round((duration - content_duration) * 1000),
+        "hit_soft_target": content_duration <= SOFT_TARGET + 0.1,
+        "hit_hard_cap": content_duration <= HARD_CAP + 0.05,
         "audio_base64": audio_base64,
         "size_bytes": len(audio_bytes)
     }
@@ -660,7 +738,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.7.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.8.0", "status": "running"}
 
 
 @app.get("/health")
@@ -738,10 +816,11 @@ async def cut_scenes_endpoint(
 @app.post("/audio/optimize")
 async def optimize_endpoint(
     file: UploadFile = File(...),
+    pad_to_duration: Optional[float] = Form(None),
     auth: str = Depends(verify_token)
 ):
     """
-    Smart context-aware audio optimization.
+    Smart context-aware audio optimization with optional symmetric padding.
     
     Targets:
       - Soft target: 3.0s (ideal)
@@ -751,7 +830,16 @@ async def optimize_endpoint(
       1. Analyze audio (volume, silence, speech density, style)
       2. Apply selective silence trimming based on style + pause categories
       3. Apply atempo (style-scaled between target/cap; emergency up to 1.20 if needed)
-      4. Return optimized audio + full analysis + execution details
+      4. [v0.8 NEW] If pad_to_duration is set, pad symmetrically with silence to reach
+         exact target duration. Example: content 2.6s + pad_to_duration=4.0 →
+         0.7s silence + 2.6s content + 0.7s silence = 4.0s total.
+      5. Return optimized audio + full analysis + execution details + padding info
+    
+    Form params:
+      file:               MP3 file to optimize (required)
+      pad_to_duration:    Optional. Float, 0.5-15.0s. If set, pads final audio
+                          symmetrically to reach exact duration. Helps Seedance render
+                          full video duration with complete voice delivery.
     
     Atempo caps:
       - Fast speaker:   1.08 (gentle, preserves dense delivery)
@@ -760,6 +848,15 @@ async def optimize_endpoint(
       - Hard cap override: up to 1.15 (or 1.20 emergency) for hitting 4s
     """
     start_time = time.time()
+    
+    # Validate pad_to_duration if provided
+    if pad_to_duration is not None:
+        if pad_to_duration < PAD_TO_DURATION_MIN or pad_to_duration > PAD_TO_DURATION_MAX:
+            raise HTTPException(
+                400,
+                f"pad_to_duration must be between {PAD_TO_DURATION_MIN} and {PAD_TO_DURATION_MAX} seconds"
+            )
+    
     job_id = str(uuid.uuid4())[:8]
     input_path = WORK_DIR / f"{job_id}_input.mp3"
 
@@ -768,7 +865,7 @@ async def optimize_endpoint(
         with open(input_path, "wb") as f:
             f.write(content)
 
-        result = optimize_audio(input_path, job_id)
+        result = optimize_audio(input_path, job_id, pad_to_duration=pad_to_duration)
         elapsed_ms = int((time.time() - start_time) * 1000)
         result["processing_time_ms"] = elapsed_ms
         
