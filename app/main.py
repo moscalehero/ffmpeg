@@ -913,22 +913,10 @@ def speedup_video(input_path: Path, output_path: Path, speed: float) -> tuple:
 # UGC PROFILES (v0.9)
 # ============================================
 UGC_PROFILES = {
-    "snappy": {
-        "target_final_duration": 2.8,
-        "target_density": 0.88,
-        "max_pause_ms": 200,
-        "max_speedup": 1.25,
-    },
-    "natural": {
-        "target_final_duration": 3.2,
-        "target_density": 0.82,
+    "default": {
+        "target_final_duration": 3.0,
+        "target_density": 0.85,
         "max_pause_ms": 250,
-        "max_speedup": 1.20,
-    },
-    "relaxed": {
-        "target_final_duration": 3.8,
-        "target_density": 0.75,
-        "max_pause_ms": 350,
         "max_speedup": 1.15,
     },
 }
@@ -1178,7 +1166,7 @@ async def video_speedup_endpoint(
     Speed up video + audio with constant pitch.
     Useful for tightening slow-paced Seedance output.
     
-    Speed range: 0.5 - 2.0 (recommended: 1.0 - 1.25 for UGC)
+    Speed range: 0.5 - 2.0 (recommended: 1.0 - 1.15 for UGC)
     """
     if speed < 0.5 or speed > 2.0:
         raise HTTPException(400, "speed must be between 0.5 and 2.0")
@@ -1224,7 +1212,6 @@ async def video_speedup_endpoint(
 @app.post("/video/optimize")
 async def video_optimize_endpoint(
     file: UploadFile = File(...),
-    profile: str = Form("snappy"),
     target_duration: Optional[float] = Form(None),
     max_speedup: Optional[float] = Form(None),
     apply_trim: bool = Form(True),
@@ -1240,23 +1227,20 @@ async def video_optimize_endpoint(
       3. Apply: trim edges, then speedup if still too slow
       4. Return optimized video + decision details
     
-    UGC Profiles:
-      - snappy:  2.8s target, 0.88 density, max 1.25x speedup (TikTok)
-      - natural: 3.2s target, 0.82 density, max 1.20x speedup (IG Reels)
-      - relaxed: 3.8s target, 0.75 density, max 1.15x speedup (YT Shorts)
+    Default profile:
+      - target_final_duration: 3.0s
+      - target_density: 0.85
+      - max_speedup: 1.15x
+      - max_pause_ms: 250
     
     Form params:
       file:              Video file (MP4)
-      profile:           UGC profile: "snappy", "natural", or "relaxed" (default: snappy)
       target_duration:   Optional override for target duration
       max_speedup:       Optional override for max speedup cap
       apply_trim:        If True, trim leading/trailing silence (default: True)
       apply_speedup:     If True, apply speedup if classified too_slow (default: True)
     """
-    if profile not in UGC_PROFILES:
-        raise HTTPException(400, f"profile must be one of: {list(UGC_PROFILES.keys())}")
-    
-    profile_settings = dict(UGC_PROFILES[profile])
+    profile_settings = dict(UGC_PROFILES["default"])
     if target_duration is not None:
         profile_settings["target_final_duration"] = target_duration
     if max_speedup is not None:
@@ -1343,7 +1327,6 @@ async def video_optimize_endpoint(
         return {
             "status": "ok",
             "action": action,
-            "profile": profile,
             "profile_settings": profile_settings,
             "original_duration": round(video_duration, 3),
             "audio_analysis": {
