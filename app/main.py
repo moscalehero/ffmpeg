@@ -1,5 +1,5 @@
 """
-FFmpeg HTTP Service v0.9
+FFmpeg HTTP Service v0.9.6
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
@@ -8,10 +8,18 @@ Endpoints:
   GET  /auth-test           - Auth verification
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, edge silence trim)
-  POST /video/analyze       - Analyze video's audio track (NEW v0.9)
-  POST /video/smart-cut     - Auto-trim leading/trailing silence from video (NEW v0.9)
-  POST /video/speedup       - Speed up video + audio with constant pitch (NEW v0.9)
-  POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker (NEW v0.9)
+  POST /video/analyze       - Analyze video's audio track
+  POST /video/smart-cut     - Auto-trim leading/trailing silence from video
+  POST /video/speedup       - Speed up video + audio with constant pitch
+  POST /video/merge-audio   - Merge silent video with audio track (NEW v0.9.6)
+  POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker
+
+Changelog v0.9.6:
+  - NEW: /video/merge-audio endpoint for BROLL post-production
+  - Use case: Seedance generates silent BROLL (generate_audio: false)
+    then this endpoint attaches the ElevenLabs VO as audio track
+  - Flow: Seedance silent video → /video/merge-audio → /video/optimize
+  - /video/optimize UNCHANGED
 
 Changelog v0.9:
   - NEW: Video endpoints for post-Seedance processing
@@ -41,13 +49,14 @@ import uuid
 import time
 import re
 import shutil
+import urllib.request
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.9.0")
+app = FastAPI(title="FFmpeg Service", version="0.9.6")
 
 # ============================================
 # CONFIG
@@ -828,7 +837,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.6", "status": "running"}
 
 
 @app.get("/health")
@@ -1493,6 +1502,136 @@ async def video_speedup_endpoint(
         video_path.unlink(missing_ok=True)
 
 
+# ============================================
+# NEW v0.9.6: VIDEO MERGE-AUDIO ENDPOINT
+# ============================================
+@app.post("/video/merge-audio")
+async def video_merge_audio_endpoint(
+    video: UploadFile = File(..., description="Silent video file (BROLL from Seedance)"),
+    audio_url: Optional[str] = Form(None, description="URL to audio file (VO from MinIO)"),
+    audio_file: Optional[UploadFile] = File(None, description="Alternative: direct audio upload"),
+    auth: str = Depends(verify_token)
+):
+    """
+    Merge a silent video with an audio track.
+    
+    Use case: BROLL scenes generated WITHOUT audio by Seedance 2.0
+    (generate_audio: false). This endpoint attaches the ElevenLabs VO
+    as audio track before the video goes to /video/optimize.
+    
+    Audio source priority: audio_file (upload) > audio_url (download).
+    
+    Behavior:
+      - Audio shorter than video: audio plays, video continues silent to end
+      - Audio longer than video:  audio is cut to video duration
+      - Video stream: copied (no re-encode - fast + lossless)
+      - Audio stream: encoded as AAC 192kbps
+    
+    Form params:
+      video:      Silent video file (MP4) — required
+      audio_url:  Optional URL to download audio from (e.g. MinIO)
+      audio_file: Optional direct audio file upload (alternative to audio_url)
+    
+    Returns merged video as base64 + metadata.
+    
+    Pipeline position:
+      Seedance (silent BROLL) → /video/merge-audio → /video/optimize → final
+    """
+    if not audio_url and not audio_file:
+        raise HTTPException(400, "Must provide either audio_url or audio_file")
+    
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    video_path = WORK_DIR / f"{job_id}_video_in.mp4"
+    audio_path = WORK_DIR / f"{job_id}_audio_in.mp3"
+    output_path = WORK_DIR / f"{job_id}_merged.mp4"
+    
+    try:
+        # Save video
+        video_content = await video.read()
+        with open(video_path, "wb") as f:
+            f.write(video_content)
+        
+        # Get audio: prefer uploaded file, fall back to URL download
+        if audio_file:
+            audio_content = await audio_file.read()
+            with open(audio_path, "wb") as f:
+                f.write(audio_content)
+            audio_source = "upload"
+        else:
+            # Download audio from URL
+            try:
+                urllib.request.urlretrieve(audio_url, audio_path)
+                audio_source = "url_download"
+            except Exception as e:
+                raise HTTPException(400, f"Failed to download audio from URL: {e}")
+        
+        # Get durations
+        video_duration = get_duration(video_path)
+        audio_duration = get_duration(audio_path)
+        
+        if video_duration <= 0:
+            raise HTTPException(400, "Invalid video file (zero duration)")
+        if audio_duration <= 0:
+            raise HTTPException(400, "Invalid audio file (zero duration)")
+        
+        # Build merge command
+        # -map 0:v:0  → video from input 0
+        # -map 1:a:0  → audio from input 1
+        # -c:v copy   → don't re-encode video (fast + lossless)
+        # -c:a aac    → encode audio as AAC
+        # If audio longer than video, cap at video duration with -t
+        cmd = [
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+        ]
+        
+        audio_was_cut = audio_duration > video_duration
+        if audio_was_cut:
+            cmd.extend(["-t", f"{video_duration:.3f}"])
+        
+        cmd.append(str(output_path))
+        
+        ret, err = run_ffmpeg(cmd)
+        if ret != 0:
+            return {"status": "error", "error": f"merge failed: {err[:200]}"}
+        
+        output_duration = get_duration(output_path)
+        
+        # Read merged video
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        
+        return {
+            "status": "ok",
+            "audio_source": audio_source,
+            "video_duration": round(video_duration, 3),
+            "audio_duration": round(audio_duration, 3),
+            "output_duration": round(output_duration, 3),
+            "audio_was_cut": audio_was_cut,
+            "audio_shorter_than_video": audio_duration < video_duration,
+            "video_base64": video_b64,
+            "size_bytes": len(video_bytes),
+            "processing_time_ms": elapsed_ms
+        }
+    
+    finally:
+        video_path.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
+
+
+# ============================================
+# /video/optimize (UNCHANGED from v0.9.5)
+# ============================================
 @app.post("/video/optimize")
 async def video_optimize_endpoint(
     file: UploadFile = File(...),
