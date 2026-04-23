@@ -154,56 +154,57 @@ def detect_volume(input_path: Path) -> dict:
     }
 
 
-def analyze_rms_windows(input_path: Path, start: float, end: float, window_ms: int = 50) -> list:
+def analyze_rms_windows(input_path: Path, start: float, end: float, window_ms: int = 100) -> list:
     """
-    Analyze RMS energy in sliding windows over a time range.
+    Analyze RMS energy by slicing audio into windows and measuring each.
     Returns list of (window_start_s, rms_db) tuples.
     
-    Used to detect breath/puste at edges that silencedetect misses
-    (breath has energy but much lower than speech).
+    Uses slice-by-slice ffmpeg calls which gives clean per-window RMS
+    (the cumulative astats approach doesn't work for this use case).
     """
     if end - start <= 0.05:
         return []
     
-    # Use astats with reset=<window_ms> to get per-window RMS measurements
     window_s = window_ms / 1000
-    cmd = [
-        "ffmpeg", "-hide_banner",
-        "-ss", f"{start:.3f}",
-        "-i", str(input_path),
-        "-t", f"{end - start:.3f}",
-        "-af", f"astats=metadata=1:reset=1:length={window_s},ametadata=mode=print:key=lavfi.astats.Overall.RMS_level",
-        "-f", "null", "-"
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    num_windows = int((end - start) / window_s)
     
     windows = []
-    current_time = start
-    
-    for line in result.stderr.split("\n"):
-        # astats output format: lavfi.astats.Overall.RMS_level=-XX.XX
-        rms_match = re.search(r"lavfi\.astats\.Overall\.RMS_level=(-?[\d.]+|-?inf)", line)
-        if rms_match:
-            rms_str = rms_match.group(1)
+    for i in range(num_windows):
+        win_start = start + i * window_s
+        
+        cmd = [
+            "ffmpeg", "-hide_banner",
+            "-ss", f"{win_start:.3f}",
+            "-i", str(input_path),
+            "-t", f"{window_s:.3f}",
+            "-af", "astats=metadata=1,ametadata=mode=print:key=lavfi.astats.Overall.RMS_level",
+            "-f", "null", "-"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        
+        # Get the LAST RMS value (final summary after this window)
+        rms_values = re.findall(r"lavfi\.astats\.Overall\.RMS_level=(-?[\d.]+|-?inf)", result.stderr)
+        
+        if rms_values:
+            rms_str = rms_values[-1]
             if rms_str == "-inf":
-                rms_db = -100.0  # treat -inf as very low
+                rms_db = -100.0
             else:
                 rms_db = float(rms_str)
-            windows.append((round(current_time, 3), round(rms_db, 2)))
-            current_time += window_s
+            windows.append((round(win_start, 3), round(rms_db, 2)))
     
     return windows
 
 
-def detect_trailing_breath(input_path: Path, analysis: dict, scan_duration: float = 0.8) -> float:
+def detect_trailing_breath(input_path: Path, analysis: dict, scan_duration: float = 1.0) -> float:
     """
     Detect trailing breath/puste that silencedetect missed.
     
     Strategy:
-      1. Calculate speech baseline RMS (from full-file mean)
-      2. Scan last N seconds in 50ms windows
-      3. Find where RMS drops below speech_floor (silence threshold + margin)
-      4. Return position where real speech ends
+      1. Calculate speech baseline from full-file mean RMS
+      2. Slice last N seconds into 100ms windows, measure each
+      3. Walk backwards to find last window with speech-level energy
+      4. Return where real speech ends
     
     Returns: estimated real speech end time (seconds from start of file)
              If no breath detected, returns file duration unchanged.
@@ -212,38 +213,37 @@ def detect_trailing_breath(input_path: Path, analysis: dict, scan_duration: floa
     mean_db = analysis["volume"]["mean_db"]
     
     if mean_db is None or duration < scan_duration:
-        return duration  # can't analyze, return unchanged
+        return duration  # can't analyze
     
-    # Speech floor: RMS that indicates real speech vs breath
-    # Mean is overall average; breath is typically 10-15dB below speech
-    # We set floor at mean - 8dB (anything quieter is suspect)
-    speech_floor_db = mean_db - 8.0
+    # Speech floor: RMS threshold for real speech vs breath
+    # Breath is typically 10-20dB below mean speech
+    # Set floor at mean - 10dB (anything quieter is suspect)
+    speech_floor_db = mean_db - 10.0
     
-    # Scan the last `scan_duration` seconds
+    # Scan the last `scan_duration` seconds in 100ms windows
     scan_start = max(0, duration - scan_duration)
-    windows = analyze_rms_windows(input_path, scan_start, duration, window_ms=50)
+    windows = analyze_rms_windows(input_path, scan_start, duration, window_ms=100)
     
     if not windows:
         return duration
     
-    # Walk backwards through windows to find last "real speech" window
+    # Walk backwards: find last window with speech-level energy
     last_speech_time = duration
     found_speech = False
     
     for window_time, rms_db in reversed(windows):
         if rms_db >= speech_floor_db:
             # This window has speech-level energy
-            last_speech_time = window_time + 0.05  # add window size
+            last_speech_time = window_time + 0.1  # add window length (100ms)
             found_speech = True
             break
     
     if not found_speech:
-        # No real speech found in scan range - unusual, return unchanged
         return duration
     
-    # Only trim if we actually found significant breath tail
+    # Only trim if breath tail is significant
     breath_duration = duration - last_speech_time
-    if breath_duration < 0.08:  # less than 80ms - not worth trimming
+    if breath_duration < 0.08:  # less than 80ms - not worth it
         return duration
     
     return round(last_speech_time, 3)
@@ -1073,7 +1073,7 @@ def decide_video_optimization(
     original_trim_end = trim_end
     
     if audio_path is not None and trailing_silence is None:
-        real_speech_end = detect_trailing_breath(audio_path, analysis, scan_duration=0.8)
+        real_speech_end = detect_trailing_breath(audio_path, analysis, scan_duration=1.0)
         if real_speech_end < duration - 0.05:
             # Found breath tail - trim it (use tighter trailing buffer)
             proposed_trim_end = min(duration, real_speech_end + trailing_keep_s)
@@ -1156,7 +1156,18 @@ def decide_video_optimization(
         emphasis_reasons.append(f"flat slow delivery (onset rate {onset_rate:.2f})")
     
     # Classify: high emphasis = deliberate performance, low = just slow
-    is_emphatic = emphasis_score >= 3
+    # Require strong signals (raised from 3 to 5 for Seedance context)
+    is_emphatic = emphasis_score >= 5
+    
+    # Override: If file is significantly too long (>10% over target),
+    # it's more likely Seedance stretching than genuine emphasis.
+    # Apply max speedup even if some emphasis signals triggered.
+    if is_emphatic and trimmed_duration > target_duration * 1.1:
+        is_emphatic = False
+        emphasis_reasons.append(
+            f"OVERRIDE: duration {trimmed_duration:.2f}s too long "
+            f"(>{target_duration * 1.1:.2f}s = target * 1.1), treating as Seedance stretching"
+        )
     
     # Calculate speedup (ALWAYS apply at least min_speedup unless too_fast)
     min_speedup_val = profile.get("min_speedup", 1.0)
