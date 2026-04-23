@@ -85,9 +85,11 @@ DENSITY_FAST = 0.85
 DENSITY_NORMAL = 0.70
 
 # Edge silence (v0.8.1) - always trim leading/trailing silence
-EDGE_SILENCE_MIN_MS = 50      # trim edges only if they exceed this
-EDGE_SILENCE_KEEP_MS = 50     # but keep this much for natural fade-in/out
-EDGE_TOLERANCE = 0.05         # tolerance for detecting edge position (50ms)
+EDGE_SILENCE_MIN_MS = 50              # trim edges only if they exceed this
+EDGE_SILENCE_KEEP_LEADING_MS = 50     # buffer at start (natural fade-in)
+EDGE_SILENCE_KEEP_TRAILING_MS = 25    # buffer at end (tight cut, avoid blink-tails)
+EDGE_SILENCE_KEEP_MS = 50             # legacy fallback (kept for compatibility)
+EDGE_TOLERANCE = 0.05                 # tolerance for detecting edge position (50ms)
 
 security = HTTPBearer()
 
@@ -511,7 +513,7 @@ def build_segments_from_silences(duration: float, silences: list, trim_rules: di
         "trailing_detected": trailing_silence is not None
     }
     
-    # Handle leading silence: start speech after leading silence (keep EDGE_SILENCE_KEEP_MS buffer)
+    # Handle leading silence: start speech after leading silence (keep 50ms buffer)
     if leading_silence is not None:
         keep_seconds = EDGE_SILENCE_KEEP_MS / 1000
         last_end = max(0, leading_silence["end"] - keep_seconds)
@@ -1050,15 +1052,17 @@ def decide_video_optimization(
             if silences[-1] is not leading_silence:
                 trailing_silence = silences[-1]
     
-    # Calculate cut boundaries (keep 50ms buffer on each edge)
-    keep_seconds = EDGE_SILENCE_KEEP_MS / 1000
+    # Calculate cut boundaries (asymmetric: 50ms leading / 25ms trailing)
+    leading_keep_s = EDGE_SILENCE_KEEP_LEADING_MS / 1000
+    trailing_keep_s = EDGE_SILENCE_KEEP_TRAILING_MS / 1000
+    
     if leading_silence:
-        trim_start = max(0, leading_silence["end"] - keep_seconds)
+        trim_start = max(0, leading_silence["end"] - leading_keep_s)
     else:
         trim_start = 0.0
     
     if trailing_silence:
-        trim_end = min(duration, trailing_silence["start"] + keep_seconds)
+        trim_end = min(duration, trailing_silence["start"] + trailing_keep_s)
     else:
         trim_end = duration
     
@@ -1071,8 +1075,8 @@ def decide_video_optimization(
     if audio_path is not None and trailing_silence is None:
         real_speech_end = detect_trailing_breath(audio_path, analysis, scan_duration=0.8)
         if real_speech_end < duration - 0.05:
-            # Found breath tail - trim it (keep 50ms buffer)
-            proposed_trim_end = min(duration, real_speech_end + keep_seconds)
+            # Found breath tail - trim it (use tighter trailing buffer)
+            proposed_trim_end = min(duration, real_speech_end + trailing_keep_s)
             if proposed_trim_end < trim_end:
                 breath_trimmed_ms = round((trim_end - proposed_trim_end) * 1000)
                 trim_end = proposed_trim_end
