@@ -1124,7 +1124,7 @@ def decide_video_optimization(
         classification = "good"
     
     # ============================================
-    # EMPHASIS DETECTION (v0.9.2)
+    # EMPHASIS DETECTION (v0.9.3)
     # Distinguishes deliberate performance from actual slow delivery
     # ============================================
     emphasis_score = 0
@@ -1135,45 +1135,74 @@ def decide_video_optimization(
         max_mid_pause = max(mid_pause_durations)
         avg_pause_calc = sum(mid_pause_durations) / len(mid_pause_durations)
         
-        # Signal 1: Few pauses (1-2) suggests deliberate delivery
+        # Signal 1: Pause count (fewer = more deliberate)
         if len(mid_silences) <= 2:
             emphasis_score += 2
             emphasis_reasons.append(f"few pauses ({len(mid_silences)})")
         elif len(mid_silences) <= 3:
-            emphasis_score += 1
+            emphasis_score += 2
             emphasis_reasons.append(f"moderate pause count ({len(mid_silences)})")
+        elif len(mid_silences) <= 4:
+            emphasis_score += 1
+            emphasis_reasons.append(f"balanced pauses ({len(mid_silences)})")
         
-        # Signal 2: One pause stands out (dominant emphasis beat)
+        # Signal 2: Average pause duration (long avg = deliberate pacing)
+        if avg_pause_calc >= 400:
+            emphasis_score += 3
+            emphasis_reasons.append(f"very long avg pause ({avg_pause_calc:.0f}ms)")
+        elif avg_pause_calc >= 300:
+            emphasis_score += 2
+            emphasis_reasons.append(f"long avg pause ({avg_pause_calc:.0f}ms)")
+        elif avg_pause_calc >= 200:
+            emphasis_score += 1
+            emphasis_reasons.append(f"moderate avg pause ({avg_pause_calc:.0f}ms)")
+        
+        # Signal 3: Dominant pause (single emphasis beat stands out)
         if avg_pause_calc > 0 and max_mid_pause / avg_pause_calc >= 1.5 and max_mid_pause >= 300:
             emphasis_score += 2
             emphasis_reasons.append(f"dominant pause ({max_mid_pause}ms vs avg {avg_pause_calc:.0f}ms)")
         
-        # Signal 3: Long pauses (>=350ms) suggest dramatic beats
-        long_pauses = [p for p in mid_pause_durations if p >= 350]
-        if long_pauses:
-            emphasis_score += len(long_pauses)
-            emphasis_reasons.append(f"{len(long_pauses)} dramatic pauses (>=350ms)")
+        # Signal 4: Weighted dramatic pauses (by duration, not just count)
+        dramatic_score = 0
+        for p in mid_pause_durations:
+            if p >= 600:
+                dramatic_score += 3    # very dramatic
+            elif p >= 450:
+                dramatic_score += 2    # clearly dramatic
+            elif p >= 350:
+                dramatic_score += 1    # mildly dramatic
+        
+        if dramatic_score > 0:
+            emphasis_score += dramatic_score
+            count_dramatic = len([p for p in mid_pause_durations if p >= 350])
+            emphasis_reasons.append(f"{count_dramatic} dramatic pause(s) weighted +{dramatic_score}")
     
-    # Signal 4: Genuinely slow (flat onset rate + slow style + no emphasis)
-    # Emphatic delivery has strategic pauses but moderate onset rate
+    # Signal 5: Penalty for flat slow delivery (onset < 1.0 AND no other emphasis)
     style = analysis["speech"]["style"]
-    if style == "slow" and onset_rate < 1.0 and emphasis_score < 2:
+    if style == "slow" and onset_rate < 1.0 and emphasis_score < 3:
         emphasis_score -= 2
         emphasis_reasons.append(f"flat slow delivery (onset rate {onset_rate:.2f})")
     
-    # Classify: high emphasis = deliberate performance, low = just slow
-    # Require strong signals (raised from 3 to 5 for Seedance context)
-    is_emphatic = emphasis_score >= 5
+    # Threshold: Need score >= 4 for emphatic classification
+    is_emphatic = emphasis_score >= 4
     
-    # Override: If file is significantly too long (>10% over target),
-    # it's more likely Seedance stretching than genuine emphasis.
-    # Apply max speedup even if some emphasis signals triggered.
-    if is_emphatic and trimmed_duration > target_duration * 1.1:
-        is_emphatic = False
-        emphasis_reasons.append(
-            f"OVERRIDE: duration {trimmed_duration:.2f}s too long "
-            f"(>{target_duration * 1.1:.2f}s = target * 1.1), treating as Seedance stretching"
-        )
+    # Smart override based on emphasis confidence + duration
+    # Higher emphasis score = allow longer duration before overriding
+    # Score 4-6:  override if > 1.20x target (moderate confidence)
+    # Score 7+:   override if > 1.35x target (high confidence in emphasis)
+    if is_emphatic:
+        if emphasis_score >= 7:
+            override_threshold = target_duration * 1.35  # generous for strong emphasis
+        else:
+            override_threshold = target_duration * 1.20  # moderate for weak emphasis
+        
+        if trimmed_duration > override_threshold:
+            is_emphatic = False
+            emphasis_reasons.append(
+                f"OVERRIDE: duration {trimmed_duration:.2f}s > {override_threshold:.2f}s "
+                f"(threshold scaled by emphasis score {emphasis_score}), "
+                f"treating as Seedance stretching"
+            )
     
     # Calculate speedup (ALWAYS apply at least min_speedup unless too_fast)
     min_speedup_val = profile.get("min_speedup", 1.0)
