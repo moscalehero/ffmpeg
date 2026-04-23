@@ -1250,20 +1250,34 @@ def decide_video_optimization(
     elif classification == "too_slow":
         if is_emphatic:
             # DELIBERATE performance with emphasis beats - respect the delivery
-            # Only apply gentle min_speedup
+            # Fixed gentle speedup - NO gradient for emphatic clips
+            # (preserves emphasis beats, natural delivery)
             speedup = min_speedup_val
-            speedup_reason = f"emphatic delivery detected (score {emphasis_score}): {', '.join(emphasis_reasons)}. Gentle {min_speedup_val}x boost."
+            speedup_reason = (
+                f"emphatic delivery (score {emphasis_score}): "
+                f"{', '.join(emphasis_reasons)}. Gentle {min_speedup_val}x boost."
+            )
         else:
-            # Default for too_slow: use max_speedup (Seedance artificially stretches voice)
-            # Only scale down if file is very close to target (no need for max)
+            # Gradient speedup based on how far over target
+            # Smooth interpolation between min and max speedup
             if trimmed_duration <= target_duration * 1.05:
-                # Within 5% of target - no aggressive speedup needed
+                # Within 5% of target - just baseline boost
                 speedup = min_speedup_val
-                speedup_reason = f"too_slow but close to target ({trimmed_duration:.2f}s): gentle {min_speedup_val}x boost"
+                speedup_reason = (
+                    f"too_slow but close to target ({trimmed_duration:.2f}s): "
+                    f"gentle {min_speedup_val}x boost"
+                )
             else:
-                # Standard too_slow - apply max speedup to counter Seedance stretching
-                speedup = max_speedup_val
-                speedup_reason = f"too_slow, non-emphatic: max {max_speedup_val}x speedup (counters Seedance stretching)"
+                # Calculate ideal speedup (what would bring exactly to target)
+                ideal_speedup = trimmed_duration / target_duration
+                
+                # Clamp to min/max range
+                speedup = max(min_speedup_val, min(ideal_speedup, max_speedup_val))
+                
+                speedup_reason = (
+                    f"too_slow gradient: {trimmed_duration:.2f}s needs {ideal_speedup:.3f}x "
+                    f"to hit target, clamped to {speedup:.3f}x (range {min_speedup_val}-{max_speedup_val})"
+                )
         
         speedup = round(speedup, 3)
     else:
