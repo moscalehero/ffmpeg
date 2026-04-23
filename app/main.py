@@ -972,16 +972,26 @@ def extract_audio_from_video(video_path: Path, audio_path: Path) -> tuple:
 
 
 def cut_video_segment(input_path: Path, output_path: Path, start: float, end: float) -> tuple:
-    """Cut video+audio to [start, end] range. Re-encodes for accurate cuts."""
+    """
+    Cut video+audio to [start, end] range with frame-accurate cuts.
+    
+    Uses slow seek (-ss AFTER -i) for frame-accurate decoding:
+      - Decodes from start of file
+      - Skips frames until start timestamp (accurate, no black frames)
+      - Slower than fast seek but guarantees correct output
+    
+    Also forces keyframe at start to avoid black frames at beginning.
+    """
     duration = end - start
     return run_ffmpeg([
-        "-accurate_seek",
-        "-ss", f"{start:.3f}",
         "-i", str(input_path),
+        "-ss", f"{start:.3f}",
         "-t", f"{duration:.3f}",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-force_key_frames", "0",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
+        "-avoid_negative_ts", "make_zero",
         str(output_path)
     ])
 
