@@ -204,7 +204,7 @@ def detect_trailing_breath(input_path: Path, analysis: dict, scan_duration: floa
       1. Calculate speech baseline from full-file mean RMS
       2. Slice last N seconds into 100ms windows, measure each
       3. Walk backwards to find last window with speech-level energy
-      4. Return where real speech ends
+      4. Return where real speech ends (+ grace period for fricatives)
     
     Returns: estimated real speech end time (seconds from start of file)
              If no breath detected, returns file duration unchanged.
@@ -216,9 +216,9 @@ def detect_trailing_breath(input_path: Path, analysis: dict, scan_duration: floa
         return duration  # can't analyze
     
     # Speech floor: RMS threshold for real speech vs breath
-    # Breath is typically 10-20dB below mean speech
-    # Set floor at mean - 10dB (anything quieter is suspect)
-    speech_floor_db = mean_db - 10.0
+    # Set at mean - 15dB (was -10dB - too aggressive for fricatives like 's', 'f', 'sh')
+    # Fricatives are quieter than vowels but still real speech
+    speech_floor_db = mean_db - 15.0
     
     # Scan the last `scan_duration` seconds in 100ms windows
     scan_start = max(0, duration - scan_duration)
@@ -240,6 +240,12 @@ def detect_trailing_breath(input_path: Path, analysis: dict, scan_duration: floa
     
     if not found_speech:
         return duration
+    
+    # Add fricative grace period - consonants like 's','f','sh' decay slowly
+    # and their RMS tail can extend 80-150ms beyond the detected end
+    FRICATIVE_GRACE_MS = 120
+    last_speech_time += FRICATIVE_GRACE_MS / 1000
+    last_speech_time = min(last_speech_time, duration)
     
     # Only trim if breath tail is significant
     breath_duration = duration - last_speech_time
