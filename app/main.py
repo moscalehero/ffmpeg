@@ -1052,11 +1052,25 @@ def decide_video_optimization(
     trailing_silence = None
     
     if silences:
+        # Leading: pause at the very start
         if silences[0]["start"] <= EDGE_TOLERANCE and silences[0]["duration_ms"] > EDGE_SILENCE_MIN_MS:
             leading_silence = silences[0]
-        if silences[-1]["end"] >= duration - EDGE_TOLERANCE and silences[-1]["duration_ms"] > EDGE_SILENCE_MIN_MS:
-            if silences[-1] is not leading_silence:
-                trailing_silence = silences[-1]
+        
+        # Trailing: pause at/near the end
+        # Strict: pause ends within 50ms of duration
+        # OR: large pause (>=400ms) ends within 400ms of duration (catches
+        #     cases where short speech/breath exists between pause and end)
+        last_silence = silences[-1]
+        if last_silence is not leading_silence:
+            ends_near = last_silence["end"] >= duration - EDGE_TOLERANCE
+            is_long_near_end = (
+                last_silence["duration_ms"] >= 400
+                and last_silence["end"] >= duration - 0.4
+            )
+            has_min_duration = last_silence["duration_ms"] > EDGE_SILENCE_MIN_MS
+            
+            if has_min_duration and (ends_near or is_long_near_end):
+                trailing_silence = last_silence
     
     # Calculate cut boundaries (asymmetric: 50ms leading / 25ms trailing)
     leading_keep_s = EDGE_SILENCE_KEEP_LEADING_MS / 1000
@@ -1177,9 +1191,20 @@ def decide_video_optimization(
             count_dramatic = len([p for p in mid_pause_durations if p >= 350])
             emphasis_reasons.append(f"{count_dramatic} dramatic pause(s) weighted +{dramatic_score}")
     
-    # Signal 5: Penalty for flat slow delivery (onset < 1.0 AND no other emphasis)
+    # Signal 5: Penalty for flat/stretched delivery
+    # True emphatic delivery has tight speech between pauses
+    # Stretched delivery has low density AND low onset rate even with long pauses
     style = analysis["speech"]["style"]
-    if style == "slow" and onset_rate < 1.0 and emphasis_score < 3:
+    
+    # Strong penalty: slow style + low onset + low density = definitely stretched
+    # (e.g. Seedance artificial stretching with random long pause)
+    if style == "slow" and onset_rate < 1.0 and trimmed_density < 0.80:
+        emphasis_score -= 6
+        emphasis_reasons.append(
+            f"STRETCHED penalty -6: slow + onset {onset_rate:.2f} + density {trimmed_density:.2f}"
+        )
+    # Moderate penalty: flat slow delivery without other strong signals
+    elif style == "slow" and onset_rate < 1.0 and emphasis_score < 3:
         emphasis_score -= 2
         emphasis_reasons.append(f"flat slow delivery (onset rate {onset_rate:.2f})")
     
