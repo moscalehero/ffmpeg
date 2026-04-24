@@ -775,7 +775,7 @@ def cut_scene(
     input_path: Path,
     scene: dict,
     job_id: str,
-    padding: float = 0.2,
+    padding: float = 0.05,
     fade: float = 0.03
 ) -> dict:
     """Cut a scene from input audio at exact timestamps."""
@@ -867,7 +867,7 @@ def auth_test(auth: str = Depends(verify_token)):
 async def cut_scenes_endpoint(
     file: UploadFile = File(...),
     scenes: str = Form(...),
-    padding: float = Form(0.2),
+    padding: float = Form(0.05),
     fade: float = Form(0.03),
     auth: str = Depends(verify_token)
 ):
