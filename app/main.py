@@ -1,5 +1,5 @@
 """
-FFmpeg HTTP Service v0.9.6
+FFmpeg HTTP Service v0.9.7
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
@@ -11,8 +11,14 @@ Endpoints:
   POST /video/analyze       - Analyze video's audio track
   POST /video/smart-cut     - Auto-trim leading/trailing silence from video
   POST /video/speedup       - Speed up video + audio with constant pitch
-  POST /video/merge-audio   - Merge silent video with audio track (NEW v0.9.6)
+  POST /video/merge-audio   - Merge silent video with audio track (v0.9.6)
   POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker
+
+Changelog v0.9.7:
+  - Default padding in /audio/cut-scenes increased from 0.05 to 0.2 (200ms each side)
+  - Prevents fricatives (s, f, sh) and decay tails from being cut off
+  - Extra padding gets automatically trimmed by /audio/optimize downstream
+  - No breaking change - padding parameter still overridable via form field
 
 Changelog v0.9.6:
   - NEW: /video/merge-audio endpoint for BROLL post-production
@@ -56,7 +62,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.9.6")
+app = FastAPI(title="FFmpeg Service", version="0.9.7")
 
 # ============================================
 # CONFIG
@@ -769,7 +775,7 @@ def cut_scene(
     input_path: Path,
     scene: dict,
     job_id: str,
-    padding: float = 0.05,
+    padding: float = 0.2,
     fade: float = 0.03
 ) -> dict:
     """Cut a scene from input audio at exact timestamps."""
@@ -837,7 +843,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.6", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.7", "status": "running"}
 
 
 @app.get("/health")
@@ -861,7 +867,7 @@ def auth_test(auth: str = Depends(verify_token)):
 async def cut_scenes_endpoint(
     file: UploadFile = File(...),
     scenes: str = Form(...),
-    padding: float = Form(0.05),
+    padding: float = Form(0.2),
     fade: float = Form(0.03),
     auth: str = Depends(verify_token)
 ):
