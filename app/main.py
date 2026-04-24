@@ -1,11 +1,12 @@
 """
-FFmpeg HTTP Service v0.9.7
+FFmpeg HTTP Service v0.9.9
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
+  POST /audio/snap-scenes   - Snap ElevenLabs timestamps to nearest silence (v0.9.9)
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, edge silence trim)
   POST /video/analyze       - Analyze video's audio track
@@ -14,11 +15,26 @@ Endpoints:
   POST /video/merge-audio   - Merge silent video with audio track (v0.9.6)
   POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker
 
-Changelog v0.9.7:
-  - Default padding in /audio/cut-scenes increased from 0.05 to 0.2 (200ms each side)
-  - Prevents fricatives (s, f, sh) and decay tails from being cut off
-  - Extra padding gets automatically trimmed by /audio/optimize downstream
-  - No breaking change - padding parameter still overridable via form field
+Changelog v0.9.9:
+  - NEW: /audio/snap-scenes endpoint — hybrid timestamp correction
+  - Takes ElevenLabs character-level timestamps as HINT, then acoustically
+    snaps each scene boundary to the nearest real silence midpoint
+  - Use as pre-processor before /audio/cut-scenes for max precision
+  - Flow: TTS → snap-scenes → cut-scenes → optimize
+  - Fallback: if no silence found in window, keeps original timestamp
+  - Prevents overlaps by coordinating adjacent scene boundaries
+
+Changelog v0.9.8:
+  - Reverted default padding in /audio/cut-scenes back to 0.05
+  - Reason: Root cause of cut-off fricatives was upstream (combined VO had no
+    sentence breaks between scenes). Fixed in voiceover_assembly_v1.3.js by
+    joining scenes with ". " instead of " " — natural pauses between scenes
+    now give ElevenLabs proper word boundaries.
+  - With proper sentence breaks upstream, minimal padding (0.05) is sufficient.
+
+Changelog v0.9.7 (superseded):
+  - Increased default padding to 0.2 — turned out to be patching a symptom.
+  - Real fix is upstream in VO assembly (see v0.9.8).
 
 Changelog v0.9.6:
   - NEW: /video/merge-audio endpoint for BROLL post-production
@@ -62,7 +78,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.9.7")
+app = FastAPI(title="FFmpeg Service", version="0.9.9")
 
 # ============================================
 # CONFIG
@@ -843,7 +859,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.7", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.9", "status": "running"}
 
 
 @app.get("/health")
@@ -861,6 +877,280 @@ def health():
 @app.get("/auth-test")
 def auth_test(auth: str = Depends(verify_token)):
     return {"status": "authenticated"}
+
+
+# ============================================
+# v0.9.9 — SNAP SCENE TIMESTAMPS TO SILENCE
+# Hybrid approach: use ElevenLabs timestamps as hint,
+# then acoustic-snap to nearest real silence for precision.
+# ============================================
+def find_nearest_silence(
+    target_time: float,
+    silences: list,
+    window_s: float = 0.5,
+    min_silence_ms: int = 150
+) -> Optional[dict]:
+    """
+    Find the silence closest to target_time within window, with min duration.
+    
+    Args:
+        target_time: timestamp we want to snap to (from ElevenLabs alignment)
+        silences: list of detected silences [{start, end, duration, duration_ms}, ...]
+        window_s: search window (+/- seconds around target)
+        min_silence_ms: minimum silence duration to count as valid
+    
+    Returns:
+        Best matching silence dict, or None if no match
+    """
+    window_start = target_time - window_s
+    window_end = target_time + window_s
+    
+    candidates = []
+    for s in silences:
+        # Check min duration
+        if s.get("duration_ms", int(s["duration"] * 1000)) < min_silence_ms:
+            continue
+        
+        # Check if silence overlaps the search window
+        # (silence must have ANY part within window)
+        if s["end"] < window_start or s["start"] > window_end:
+            continue
+        
+        # Calculate midpoint and distance to target
+        midpoint = (s["start"] + s["end"]) / 2
+        distance = abs(midpoint - target_time)
+        candidates.append((distance, s, midpoint))
+    
+    if not candidates:
+        return None
+    
+    # Sort by distance, pick closest
+    candidates.sort(key=lambda x: x[0])
+    return {
+        "silence": candidates[0][1],
+        "midpoint": candidates[0][2],
+        "distance_ms": round(candidates[0][0] * 1000),
+    }
+
+
+@app.post("/audio/snap-scenes")
+async def snap_scenes_endpoint(
+    file: UploadFile = File(...),
+    scenes: str = Form(...),
+    search_window_ms: int = Form(500),
+    min_silence_ms: int = Form(150),
+    auth: str = Depends(verify_token)
+):
+    """
+    Snap scene timestamps to the nearest real silence in the audio.
+    
+    Use case:
+      ElevenLabs gives us character-level timestamps that are CLOSE to the
+      actual word boundary but not always accurate (fricative decay, etc.).
+      This endpoint analyzes the audio for actual silences and snaps each
+      scene boundary to the midpoint of the nearest real silence.
+    
+    Flow:
+      ElevenLabs TTS → /audio/snap-scenes → /audio/cut-scenes → /audio/optimize
+    
+    Form params:
+      file:             Combined audio file (MP3)
+      scenes:           JSON array of scenes [{part, start, end}, ...]
+      search_window_ms: How far to search around each timestamp (default 500ms)
+      min_silence_ms:   Minimum silence duration to count as "real pause" (default 150ms)
+    
+    Logic:
+      For each scene boundary (except scene 1 start and last scene end):
+        1. Find silences within +/- window_ms of the ElevenLabs timestamp
+        2. Filter: silence must be >= min_silence_ms
+        3. Pick silence whose midpoint is CLOSEST to the ElevenLabs timestamp
+        4. Snap boundary to that silence's midpoint
+      
+      Fallback: If no silence found in window → keep original timestamp
+    
+    Returns:
+      - Adjusted scenes array
+      - Per-scene snap metadata (original_time, snapped_time, silence_used, etc.)
+      - Summary stats (snapped_count, fallback_count)
+    """
+    try:
+        scenes_list = json.loads(scenes)
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, f"Invalid scenes JSON: {e}")
+    
+    if not isinstance(scenes_list, list) or not scenes_list:
+        raise HTTPException(400, "scenes must be a non-empty array")
+    
+    for i, scene in enumerate(scenes_list):
+        if "part" not in scene or "start" not in scene or "end" not in scene:
+            raise HTTPException(400, f"Scene #{i} missing required fields")
+    
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    input_path = WORK_DIR / f"{job_id}_input.mp3"
+    
+    try:
+        content = await file.read()
+        with open(input_path, "wb") as f:
+            f.write(content)
+        
+        audio_duration = get_duration(input_path)
+        
+        # Analyze audio for silences
+        volume = detect_volume(input_path)
+        if volume["mean_db"] is not None:
+            silence_threshold_db = volume["mean_db"] - SILENCE_RELATIVE_DB
+        else:
+            silence_threshold_db = SILENCE_FALLBACK_DB
+        
+        silences = detect_silences(
+            input_path,
+            threshold_db=silence_threshold_db,
+            min_duration=MIN_PAUSE_DETECT_MS / 1000
+        )
+        
+        # Add duration_ms for convenience
+        for s in silences:
+            s["duration_ms"] = round(s["duration"] * 1000)
+        
+        # Sort scenes by start time (defensive)
+        scenes_sorted = sorted(scenes_list, key=lambda s: float(s["start"]))
+        
+        # Process each scene — snap boundaries where possible
+        window_s = search_window_ms / 1000
+        adjusted_scenes = []
+        snap_metadata = []
+        
+        snapped_count = 0
+        fallback_count = 0
+        
+        for i, scene in enumerate(scenes_sorted):
+            is_first = (i == 0)
+            is_last = (i == len(scenes_sorted) - 1)
+            
+            original_start = float(scene["start"])
+            original_end = float(scene["end"])
+            
+            # === SNAP START ===
+            # First scene: always starts at 0
+            # Other scenes: snap to silence near original_start
+            if is_first:
+                new_start = 0.0
+                start_snap_info = {"snapped": False, "reason": "first_scene"}
+            else:
+                # Snap start point
+                snap = find_nearest_silence(
+                    original_start, silences, window_s, min_silence_ms
+                )
+                if snap:
+                    new_start = round(snap["midpoint"], 3)
+                    start_snap_info = {
+                        "snapped": True,
+                        "original": original_start,
+                        "snapped_to": new_start,
+                        "delta_ms": round((new_start - original_start) * 1000),
+                        "silence_used_ms": snap["silence"]["duration_ms"],
+                        "distance_from_original_ms": snap["distance_ms"],
+                    }
+                    snapped_count += 1
+                else:
+                    new_start = original_start
+                    start_snap_info = {
+                        "snapped": False,
+                        "reason": "no_silence_in_window",
+                        "window_ms": search_window_ms,
+                    }
+                    fallback_count += 1
+            
+            # === SNAP END ===
+            # Last scene: end at audio duration (or original_end, whichever is smaller)
+            # Other scenes: snap to silence near original_end
+            if is_last:
+                new_end = min(original_end, audio_duration)
+                end_snap_info = {"snapped": False, "reason": "last_scene"}
+            else:
+                snap = find_nearest_silence(
+                    original_end, silences, window_s, min_silence_ms
+                )
+                if snap:
+                    new_end = round(snap["midpoint"], 3)
+                    end_snap_info = {
+                        "snapped": True,
+                        "original": original_end,
+                        "snapped_to": new_end,
+                        "delta_ms": round((new_end - original_end) * 1000),
+                        "silence_used_ms": snap["silence"]["duration_ms"],
+                        "distance_from_original_ms": snap["distance_ms"],
+                    }
+                    snapped_count += 1
+                else:
+                    new_end = original_end
+                    end_snap_info = {
+                        "snapped": False,
+                        "reason": "no_silence_in_window",
+                        "window_ms": search_window_ms,
+                    }
+                    fallback_count += 1
+            
+            # Sanity check: new_start < new_end
+            if new_start >= new_end:
+                # Something went wrong — fall back to originals
+                new_start = original_start
+                new_end = original_end
+                start_snap_info = {"snapped": False, "reason": "sanity_check_failed"}
+                end_snap_info = {"snapped": False, "reason": "sanity_check_failed"}
+            
+            adjusted_scenes.append({
+                "part": scene["part"],
+                "start": new_start,
+                "end": new_end,
+            })
+            
+            snap_metadata.append({
+                "part": scene["part"],
+                "original_start": original_start,
+                "original_end": original_end,
+                "new_start": new_start,
+                "new_end": new_end,
+                "start_snap": start_snap_info,
+                "end_snap": end_snap_info,
+            })
+        
+        # === COORDINATION: prevent overlaps between adjacent scenes ===
+        # If scene N's end > scene N+1's start, they'd overlap.
+        # Solution: if they snapped to different silences, sync up.
+        # If they snapped to same silence, they'll have same midpoint (no issue).
+        for i in range(len(adjusted_scenes) - 1):
+            current = adjusted_scenes[i]
+            next_scene = adjusted_scenes[i + 1]
+            
+            if current["end"] > next_scene["start"]:
+                # Overlap: use midpoint of the two
+                midpoint = (current["end"] + next_scene["start"]) / 2
+                current["end"] = round(midpoint, 3)
+                next_scene["start"] = round(midpoint, 3)
+                snap_metadata[i]["overlap_corrected"] = True
+                snap_metadata[i + 1]["overlap_corrected"] = True
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        
+        return {
+            "status": "ok",
+            "audio_duration": round(audio_duration, 3),
+            "total_silences_detected": len(silences),
+            "silence_threshold_db": round(silence_threshold_db, 2),
+            "search_window_ms": search_window_ms,
+            "min_silence_ms": min_silence_ms,
+            "snapped_count": snapped_count,
+            "fallback_count": fallback_count,
+            "total_boundaries": snapped_count + fallback_count,
+            "adjusted_scenes": adjusted_scenes,
+            "snap_details": snap_metadata,
+            "processing_time_ms": elapsed_ms,
+        }
+    
+    finally:
+        input_path.unlink(missing_ok=True)
 
 
 @app.post("/audio/cut-scenes")
