@@ -1,12 +1,12 @@
 """
-FFmpeg HTTP Service v0.9.9
+FFmpeg HTTP Service v0.9.11
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
-  POST /audio/snap-scenes   - Snap ElevenLabs timestamps to nearest silence (v0.9.9)
+  POST /audio/snap-scenes   - Gap-based quietest-point snap (v0.9.11 default)
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, edge silence trim)
   POST /video/analyze       - Analyze video's audio track
@@ -14,6 +14,23 @@ Endpoints:
   POST /video/speedup       - Speed up video + audio with constant pitch
   POST /video/merge-audio   - Merge silent video with audio track (v0.9.6)
   POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker
+
+Changelog v0.9.11:
+  - NEW DEFAULT MODE: gap_quietest
+  - Instead of scanning ±window around EACH timestamp independently (v0.9.10),
+    now scan the GAP BETWEEN adjacent scenes and find ONE shared cut point
+  - Advantages:
+    * GUARANTEED no overlaps (both scenes use same snap point)
+    * Window is defined by actual gap → searches right zone
+    * Cannot bleed into wrong scene's audio
+    * Naturally adapts to any gap size
+  - Parameters:
+    * buffer_ms (default 100): extra margin on each side of the ELL gap
+    * chunk_ms (default 20): RMS measurement resolution
+  - Old modes still available via `mode=rms_minimum` or `mode=silence`
+
+Changelog v0.9.10:
+  - IMPROVED: snap-scenes uses RMS-MINIMUM (replaced by gap_quietest in v0.9.11)
 
 Changelog v0.9.9:
   - NEW: /audio/snap-scenes endpoint — hybrid timestamp correction
@@ -78,7 +95,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.9.9")
+app = FastAPI(title="FFmpeg Service", version="0.9.11")
 
 # ============================================
 # CONFIG
@@ -859,7 +876,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.9", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.11", "status": "running"}
 
 
 @app.get("/health")
@@ -933,46 +950,219 @@ def find_nearest_silence(
     }
 
 
+def find_rms_minimum(
+    input_path: Path,
+    target_time: float,
+    audio_duration: float,
+    window_s: float = 0.3,
+    chunk_ms: int = 20
+) -> dict:
+    """
+    Find the quietest point in a window around target_time.
+    
+    This is MORE ROBUST than silence detection because it always finds
+    a minimum (even when there's no "true silence"). It uses the
+    ElevenLabs timestamp as an anchor and finds the local RMS valley
+    in the search window.
+    
+    Args:
+        input_path: audio file
+        target_time: anchor timestamp (from ElevenLabs alignment)
+        audio_duration: total audio duration (for clamping)
+        window_s: search window (+/- seconds around target)
+        chunk_ms: size of each RMS measurement chunk (smaller = more precise)
+    
+    Returns:
+        dict with:
+          - quietest_time: timestamp of the quietest point
+          - quietest_rms_db: RMS in dB at that point
+          - window_start, window_end: the search range used
+          - chunks_measured: how many chunks were analyzed
+          - distance_from_target_ms: how far from ElevenLabs original
+    """
+    window_start = max(0, target_time - window_s)
+    window_end = min(audio_duration, target_time + window_s)
+    
+    if window_end - window_start < 0.05:
+        # Window too small — fallback to target
+        return {
+            "quietest_time": target_time,
+            "quietest_rms_db": None,
+            "window_start": window_start,
+            "window_end": window_end,
+            "chunks_measured": 0,
+            "distance_from_target_ms": 0,
+            "fallback_reason": "window_too_small",
+        }
+    
+    # Measure RMS in small chunks across the window
+    windows = analyze_rms_windows(
+        input_path, window_start, window_end, window_ms=chunk_ms
+    )
+    
+    if not windows:
+        return {
+            "quietest_time": target_time,
+            "quietest_rms_db": None,
+            "window_start": window_start,
+            "window_end": window_end,
+            "chunks_measured": 0,
+            "distance_from_target_ms": 0,
+            "fallback_reason": "no_rms_data",
+        }
+    
+    # Find the chunk with the LOWEST RMS (quietest point)
+    # windows is list of (time, rms_db) tuples
+    quietest = min(windows, key=lambda w: w[1])
+    quietest_time = quietest[0] + (chunk_ms / 1000) / 2  # center of chunk
+    quietest_rms = quietest[1]
+    
+    return {
+        "quietest_time": round(quietest_time, 3),
+        "quietest_rms_db": round(quietest_rms, 2),
+        "window_start": round(window_start, 3),
+        "window_end": round(window_end, 3),
+        "chunks_measured": len(windows),
+        "distance_from_target_ms": round(abs(quietest_time - target_time) * 1000),
+    }
+
+
+def find_gap_quietest(
+    input_path: Path,
+    prev_end: float,
+    next_start: float,
+    audio_duration: float,
+    buffer_ms: int = 100,
+    chunk_ms: int = 20
+) -> dict:
+    """
+    Find the quietest point BETWEEN two scenes (gap-based snap).
+    
+    This is the most reliable snap method because:
+    - The window is defined by the GAP between ElevenLabs timestamps
+    - We add a buffer on each side to catch the real pause
+    - The single quietest point becomes the shared cut boundary
+    - Both scenes use the SAME point — no coordination needed
+    
+    Args:
+        input_path: audio file
+        prev_end: end timestamp of previous scene (from ElevenLabs)
+        next_start: start timestamp of next scene (from ElevenLabs)
+        audio_duration: total audio duration (for clamping)
+        buffer_ms: extra margin on each side of the gap (default 100ms)
+        chunk_ms: RMS measurement granularity (default 20ms)
+    
+    Returns:
+        dict with:
+          - cut_point: the chosen timestamp (single point used for both boundaries)
+          - cut_rms_db: RMS energy at that point
+          - gap_ms: original gap between ElevenLabs timestamps
+          - window_start, window_end: actual search range
+          - chunks_measured: number of RMS samples taken
+          - moved_from_midpoint_ms: how far cut_point is from simple gap midpoint
+    """
+    # Calculate search window: gap + buffer on each side
+    buffer_s = buffer_ms / 1000
+    window_start = max(0, prev_end - buffer_s)
+    window_end = min(audio_duration, next_start + buffer_s)
+    
+    gap_ms = round((next_start - prev_end) * 1000)
+    gap_midpoint = (prev_end + next_start) / 2
+    
+    if window_end - window_start < 0.05:
+        # Window too small — fallback to gap midpoint
+        return {
+            "cut_point": round(gap_midpoint, 3),
+            "cut_rms_db": None,
+            "gap_ms": gap_ms,
+            "window_start": round(window_start, 3),
+            "window_end": round(window_end, 3),
+            "chunks_measured": 0,
+            "moved_from_midpoint_ms": 0,
+            "fallback_reason": "window_too_small",
+        }
+    
+    # Measure RMS in small chunks across the gap+buffer window
+    windows = analyze_rms_windows(
+        input_path, window_start, window_end, window_ms=chunk_ms
+    )
+    
+    if not windows:
+        return {
+            "cut_point": round(gap_midpoint, 3),
+            "cut_rms_db": None,
+            "gap_ms": gap_ms,
+            "window_start": round(window_start, 3),
+            "window_end": round(window_end, 3),
+            "chunks_measured": 0,
+            "moved_from_midpoint_ms": 0,
+            "fallback_reason": "no_rms_data",
+        }
+    
+    # Find the chunk with LOWEST RMS
+    quietest = min(windows, key=lambda w: w[1])
+    cut_point = quietest[0] + (chunk_ms / 1000) / 2  # center of chunk
+    cut_rms = quietest[1]
+    
+    return {
+        "cut_point": round(cut_point, 3),
+        "cut_rms_db": round(cut_rms, 2),
+        "gap_ms": gap_ms,
+        "window_start": round(window_start, 3),
+        "window_end": round(window_end, 3),
+        "chunks_measured": len(windows),
+        "moved_from_midpoint_ms": round(abs(cut_point - gap_midpoint) * 1000),
+    }
+
+
 @app.post("/audio/snap-scenes")
 async def snap_scenes_endpoint(
     file: UploadFile = File(...),
     scenes: str = Form(...),
-    search_window_ms: int = Form(500),
+    buffer_ms: int = Form(100),
+    chunk_ms: int = Form(20),
+    mode: str = Form("gap_quietest"),
+    search_window_ms: int = Form(300),
     min_silence_ms: int = Form(150),
     auth: str = Depends(verify_token)
 ):
     """
-    Snap scene timestamps to the nearest real silence in the audio.
+    Snap scene boundaries to the quietest point between adjacent scenes.
     
-    Use case:
-      ElevenLabs gives us character-level timestamps that are CLOSE to the
-      actual word boundary but not always accurate (fricative decay, etc.).
-      This endpoint analyzes the audio for actual silences and snaps each
-      scene boundary to the midpoint of the nearest real silence.
+    v0.9.11 GAP-BASED MODE (default):
+      For each pair of adjacent scenes, find the single quietest point
+      BETWEEN their ElevenLabs timestamps. Both scene boundaries (prev end
+      + next start) snap to this shared cut-point.
     
-    Flow:
-      ElevenLabs TTS → /audio/snap-scenes → /audio/cut-scenes → /audio/optimize
+    Benefits vs v0.9.10 (target-anchored RMS):
+      ✅ No overlap/coordination issues — both scenes use SAME point
+      ✅ Window is defined by actual gap → always searches in the right zone
+      ✅ Can't snap into wrong scene's audio
+      ✅ Naturally handles any gap size (10ms to 500ms)
     
     Form params:
       file:             Combined audio file (MP3)
-      scenes:           JSON array of scenes [{part, start, end}, ...]
-      search_window_ms: How far to search around each timestamp (default 500ms)
-      min_silence_ms:   Minimum silence duration to count as "real pause" (default 150ms)
+      scenes:           JSON array [{part, start, end}, ...]
+      mode:             'gap_quietest' (DEFAULT) | 'rms_minimum' | 'silence'
+      buffer_ms:        Extra margin around each gap (default 100ms)
+      chunk_ms:         RMS measurement granularity (default 20ms)
+      search_window_ms: Used in 'rms_minimum' and 'silence' modes (default 300ms)
+      min_silence_ms:   Used in 'silence' mode only (default 150ms)
     
-    Logic:
-      For each scene boundary (except scene 1 start and last scene end):
-        1. Find silences within +/- window_ms of the ElevenLabs timestamp
-        2. Filter: silence must be >= min_silence_ms
-        3. Pick silence whose midpoint is CLOSEST to the ElevenLabs timestamp
-        4. Snap boundary to that silence's midpoint
-      
-      Fallback: If no silence found in window → keep original timestamp
+    Gap-based logic (mode=gap_quietest):
+      For each boundary between scene N and scene N+1:
+        1. window = [scene_N.end - buffer, scene_N+1.start + buffer]
+        2. Measure RMS in chunk_ms chunks across window
+        3. Find lowest-RMS chunk → that's the cut point
+        4. Set scene_N.end = scene_N+1.start = cut_point
     
     Returns:
-      - Adjusted scenes array
-      - Per-scene snap metadata (original_time, snapped_time, silence_used, etc.)
-      - Summary stats (snapped_count, fallback_count)
+      - Adjusted scenes array (no gaps, no overlaps, cuts in actual silence)
+      - Per-boundary snap details (cut_point, RMS value, gap size, etc.)
     """
+    if mode not in ("gap_quietest", "rms_minimum", "silence"):
+        raise HTTPException(400, "mode must be 'gap_quietest', 'rms_minimum', or 'silence'")
+    
     try:
         scenes_list = json.loads(scenes)
     except json.JSONDecodeError as e:
@@ -995,34 +1185,215 @@ async def snap_scenes_endpoint(
             f.write(content)
         
         audio_duration = get_duration(input_path)
+        window_s = search_window_ms / 1000
         
-        # Analyze audio for silences
-        volume = detect_volume(input_path)
-        if volume["mean_db"] is not None:
-            silence_threshold_db = volume["mean_db"] - SILENCE_RELATIVE_DB
-        else:
-            silence_threshold_db = SILENCE_FALLBACK_DB
-        
-        silences = detect_silences(
-            input_path,
-            threshold_db=silence_threshold_db,
-            min_duration=MIN_PAUSE_DETECT_MS / 1000
-        )
-        
-        # Add duration_ms for convenience
-        for s in silences:
-            s["duration_ms"] = round(s["duration"] * 1000)
+        # Pre-analyze silences only if mode requires it
+        silences = []
+        silence_threshold_db = None
+        if mode == "silence":
+            volume = detect_volume(input_path)
+            if volume["mean_db"] is not None:
+                silence_threshold_db = volume["mean_db"] - SILENCE_RELATIVE_DB
+            else:
+                silence_threshold_db = SILENCE_FALLBACK_DB
+            
+            silences = detect_silences(
+                input_path,
+                threshold_db=silence_threshold_db,
+                min_duration=MIN_PAUSE_DETECT_MS / 1000
+            )
+            for s in silences:
+                s["duration_ms"] = round(s["duration"] * 1000)
         
         # Sort scenes by start time (defensive)
         scenes_sorted = sorted(scenes_list, key=lambda s: float(s["start"]))
         
-        # Process each scene — snap boundaries where possible
-        window_s = search_window_ms / 1000
+        # ============================================
+        # GAP-BASED MODE (v0.9.11 default)
+        # ============================================
+        if mode == "gap_quietest":
+            adjusted_scenes = []
+            snap_metadata = []
+            cut_points = []
+            
+            # Step 1: For each pair of adjacent scenes, find the shared cut point
+            # cut_points[i] = the snap between scene i and scene i+1
+            for i in range(len(scenes_sorted) - 1):
+                prev_end = float(scenes_sorted[i]["end"])
+                next_start = float(scenes_sorted[i + 1]["start"])
+                
+                # Safety: if ElevenLabs has overlapping timestamps (prev_end > next_start),
+                # swap the window to still cover the area
+                if prev_end > next_start:
+                    search_start = next_start
+                    search_end = prev_end
+                else:
+                    search_start = prev_end
+                    search_end = next_start
+                
+                result = find_gap_quietest(
+                    input_path,
+                    search_start,
+                    search_end,
+                    audio_duration,
+                    buffer_ms=buffer_ms,
+                    chunk_ms=chunk_ms,
+                )
+                cut_points.append(result)
+            
+            # Step 2: Apply cut points to build adjusted scenes
+            for i, scene in enumerate(scenes_sorted):
+                is_first = (i == 0)
+                is_last = (i == len(scenes_sorted) - 1)
+                
+                original_start = float(scene["start"])
+                original_end = float(scene["end"])
+                
+                # Start: first scene always 0, others use the previous cut point
+                if is_first:
+                    new_start = 0.0
+                    start_snap_info = {"snapped": False, "reason": "first_scene"}
+                else:
+                    prev_cut = cut_points[i - 1]
+                    new_start = prev_cut["cut_point"]
+                    start_snap_info = {
+                        "snapped": True,
+                        "original": original_start,
+                        "snapped_to": new_start,
+                        "delta_ms": round((new_start - original_start) * 1000),
+                        "cut_rms_db": prev_cut["cut_rms_db"],
+                        "gap_ms": prev_cut["gap_ms"],
+                        "window": [prev_cut["window_start"], prev_cut["window_end"]],
+                        "moved_from_midpoint_ms": prev_cut["moved_from_midpoint_ms"],
+                    }
+                
+                # End: last scene = audio duration (capped), others use the next cut point
+                if is_last:
+                    new_end = min(original_end, audio_duration)
+                    end_snap_info = {"snapped": False, "reason": "last_scene"}
+                else:
+                    next_cut = cut_points[i]
+                    new_end = next_cut["cut_point"]
+                    end_snap_info = {
+                        "snapped": True,
+                        "original": original_end,
+                        "snapped_to": new_end,
+                        "delta_ms": round((new_end - original_end) * 1000),
+                        "cut_rms_db": next_cut["cut_rms_db"],
+                        "gap_ms": next_cut["gap_ms"],
+                        "window": [next_cut["window_start"], next_cut["window_end"]],
+                        "moved_from_midpoint_ms": next_cut["moved_from_midpoint_ms"],
+                    }
+                
+                # Sanity check
+                if new_start >= new_end:
+                    new_start = original_start
+                    new_end = original_end
+                    start_snap_info = {"snapped": False, "reason": "sanity_check_failed"}
+                    end_snap_info = {"snapped": False, "reason": "sanity_check_failed"}
+                
+                adjusted_scenes.append({
+                    "part": scene["part"],
+                    "start": round(new_start, 3),
+                    "end": round(new_end, 3),
+                })
+                
+                snap_metadata.append({
+                    "part": scene["part"],
+                    "original_start": original_start,
+                    "original_end": original_end,
+                    "new_start": round(new_start, 3),
+                    "new_end": round(new_end, 3),
+                    "start_snap": start_snap_info,
+                    "end_snap": end_snap_info,
+                })
+            
+            # In gap mode, every boundary is snapped (no coordination needed)
+            snapped_count = sum(
+                1 for m in snap_metadata
+                if m["start_snap"].get("snapped") or m["end_snap"].get("snapped")
+            ) * 2 - sum(
+                1 for m in snap_metadata
+                if m["start_snap"].get("reason") in ("first_scene", "sanity_check_failed")
+                or m["end_snap"].get("reason") in ("last_scene", "sanity_check_failed")
+            )
+            # Simpler: count actual snap events
+            snapped_count = 0
+            fallback_count = 0
+            for m in snap_metadata:
+                if m["start_snap"].get("snapped"):
+                    snapped_count += 1
+                elif m["start_snap"].get("reason") not in ("first_scene",):
+                    fallback_count += 1
+                if m["end_snap"].get("snapped"):
+                    snapped_count += 1
+                elif m["end_snap"].get("reason") not in ("last_scene",):
+                    fallback_count += 1
+            
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            
+            return {
+                "status": "ok",
+                "mode": "gap_quietest",
+                "audio_duration": round(audio_duration, 3),
+                "buffer_ms": buffer_ms,
+                "chunk_ms": chunk_ms,
+                "snapped_count": snapped_count,
+                "fallback_count": fallback_count,
+                "total_boundaries": snapped_count + fallback_count,
+                "cut_points": [
+                    {
+                        "between_scene": f"{scenes_sorted[i]['part']} -> {scenes_sorted[i+1]['part']}",
+                        "cut_point": cp["cut_point"],
+                        "cut_rms_db": cp["cut_rms_db"],
+                        "gap_ms": cp["gap_ms"],
+                        "window": [cp["window_start"], cp["window_end"]],
+                    }
+                    for i, cp in enumerate(cut_points)
+                ],
+                "adjusted_scenes": adjusted_scenes,
+                "snap_details": snap_metadata,
+                "processing_time_ms": elapsed_ms,
+            }
+        
+        # ============================================
+        # LEGACY MODES (rms_minimum, silence) — kept for backward compatibility
+        # ============================================
         adjusted_scenes = []
         snap_metadata = []
-        
         snapped_count = 0
         fallback_count = 0
+        
+        def snap_point(target_time):
+            """Snap a single timestamp using the selected legacy mode."""
+            if mode == "rms_minimum":
+                result = find_rms_minimum(
+                    input_path, target_time, audio_duration,
+                    window_s=window_s, chunk_ms=chunk_ms
+                )
+                return {
+                    "snapped": result.get("quietest_rms_db") is not None,
+                    "new_time": result["quietest_time"],
+                    "info": result,
+                }
+            else:  # silence mode
+                snap = find_nearest_silence(
+                    target_time, silences, window_s, min_silence_ms
+                )
+                if snap:
+                    return {
+                        "snapped": True,
+                        "new_time": round(snap["midpoint"], 3),
+                        "info": {
+                            "silence_used_ms": snap["silence"]["duration_ms"],
+                            "distance_from_target_ms": snap["distance_ms"],
+                        },
+                    }
+                return {
+                    "snapped": False,
+                    "new_time": target_time,
+                    "info": {"reason": "no_silence_in_window"},
+                }
         
         for i, scene in enumerate(scenes_sorted):
             is_first = (i == 0)
@@ -1031,70 +1402,45 @@ async def snap_scenes_endpoint(
             original_start = float(scene["start"])
             original_end = float(scene["end"])
             
-            # === SNAP START ===
-            # First scene: always starts at 0
-            # Other scenes: snap to silence near original_start
             if is_first:
                 new_start = 0.0
                 start_snap_info = {"snapped": False, "reason": "first_scene"}
             else:
-                # Snap start point
-                snap = find_nearest_silence(
-                    original_start, silences, window_s, min_silence_ms
-                )
-                if snap:
-                    new_start = round(snap["midpoint"], 3)
+                snap_result = snap_point(original_start)
+                new_start = round(snap_result["new_time"], 3)
+                if snap_result["snapped"]:
                     start_snap_info = {
                         "snapped": True,
                         "original": original_start,
                         "snapped_to": new_start,
                         "delta_ms": round((new_start - original_start) * 1000),
-                        "silence_used_ms": snap["silence"]["duration_ms"],
-                        "distance_from_original_ms": snap["distance_ms"],
+                        **snap_result["info"],
                     }
                     snapped_count += 1
                 else:
-                    new_start = original_start
-                    start_snap_info = {
-                        "snapped": False,
-                        "reason": "no_silence_in_window",
-                        "window_ms": search_window_ms,
-                    }
+                    start_snap_info = {"snapped": False, **snap_result["info"]}
                     fallback_count += 1
             
-            # === SNAP END ===
-            # Last scene: end at audio duration (or original_end, whichever is smaller)
-            # Other scenes: snap to silence near original_end
             if is_last:
                 new_end = min(original_end, audio_duration)
                 end_snap_info = {"snapped": False, "reason": "last_scene"}
             else:
-                snap = find_nearest_silence(
-                    original_end, silences, window_s, min_silence_ms
-                )
-                if snap:
-                    new_end = round(snap["midpoint"], 3)
+                snap_result = snap_point(original_end)
+                new_end = round(snap_result["new_time"], 3)
+                if snap_result["snapped"]:
                     end_snap_info = {
                         "snapped": True,
                         "original": original_end,
                         "snapped_to": new_end,
                         "delta_ms": round((new_end - original_end) * 1000),
-                        "silence_used_ms": snap["silence"]["duration_ms"],
-                        "distance_from_original_ms": snap["distance_ms"],
+                        **snap_result["info"],
                     }
                     snapped_count += 1
                 else:
-                    new_end = original_end
-                    end_snap_info = {
-                        "snapped": False,
-                        "reason": "no_silence_in_window",
-                        "window_ms": search_window_ms,
-                    }
+                    end_snap_info = {"snapped": False, **snap_result["info"]}
                     fallback_count += 1
             
-            # Sanity check: new_start < new_end
             if new_start >= new_end:
-                # Something went wrong — fall back to originals
                 new_start = original_start
                 new_end = original_end
                 start_snap_info = {"snapped": False, "reason": "sanity_check_failed"}
@@ -1105,7 +1451,6 @@ async def snap_scenes_endpoint(
                 "start": new_start,
                 "end": new_end,
             })
-            
             snap_metadata.append({
                 "part": scene["part"],
                 "original_start": original_start,
@@ -1116,16 +1461,11 @@ async def snap_scenes_endpoint(
                 "end_snap": end_snap_info,
             })
         
-        # === COORDINATION: prevent overlaps between adjacent scenes ===
-        # If scene N's end > scene N+1's start, they'd overlap.
-        # Solution: if they snapped to different silences, sync up.
-        # If they snapped to same silence, they'll have same midpoint (no issue).
+        # Coordination: prevent overlaps
         for i in range(len(adjusted_scenes) - 1):
             current = adjusted_scenes[i]
             next_scene = adjusted_scenes[i + 1]
-            
             if current["end"] > next_scene["start"]:
-                # Overlap: use midpoint of the two
                 midpoint = (current["end"] + next_scene["start"]) / 2
                 current["end"] = round(midpoint, 3)
                 next_scene["start"] = round(midpoint, 3)
@@ -1136,11 +1476,13 @@ async def snap_scenes_endpoint(
         
         return {
             "status": "ok",
+            "mode": mode,
             "audio_duration": round(audio_duration, 3),
-            "total_silences_detected": len(silences),
-            "silence_threshold_db": round(silence_threshold_db, 2),
             "search_window_ms": search_window_ms,
-            "min_silence_ms": min_silence_ms,
+            "chunk_ms": chunk_ms if mode == "rms_minimum" else None,
+            "min_silence_ms": min_silence_ms if mode == "silence" else None,
+            "silence_threshold_db": round(silence_threshold_db, 2) if silence_threshold_db else None,
+            "total_silences_detected": len(silences) if mode == "silence" else None,
             "snapped_count": snapped_count,
             "fallback_count": fallback_count,
             "total_boundaries": snapped_count + fallback_count,
