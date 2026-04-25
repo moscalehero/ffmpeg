@@ -1,5 +1,5 @@
 """
-FFmpeg HTTP Service v0.9.13
+FFmpeg HTTP Service v0.9.14
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
@@ -16,6 +16,14 @@ Endpoints:
   POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker
   POST /video/preset        - Lightroom-style color grading (v0.9.12)
   POST /video/concat        - Concat multiple clips with fade transitions (v0.9.13)
+  POST /video/concat-urls   - Same as /video/concat but takes URLs as JSON (v0.9.14)
+
+Changelog v0.9.14:
+  - NEW: /video/concat-urls endpoint — JSON body with URL array instead of multi-file upload
+  - Much easier from n8n: takes JSON body with `video_urls` (or `urls`) array
+  - Server downloads videos directly from URLs (e.g. MinIO)
+  - Same internal logic as /video/concat (build_concat_filter_chain)
+  - Both endpoints coexist — use whichever fits your use case
 
 Changelog v0.9.13:
   - NEW: /video/concat endpoint — multi-clip concat with crossfade transitions
@@ -116,7 +124,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.9.13")
+app = FastAPI(title="FFmpeg Service", version="0.9.14")
 
 # ============================================
 # CONFIG
@@ -897,7 +905,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.13", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.14", "status": "running"}
 
 
 @app.get("/health")
