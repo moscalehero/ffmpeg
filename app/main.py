@@ -125,7 +125,7 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-app = FastAPI(title="FFmpeg Service", version="0.9.15")
+app = FastAPI(title="FFmpeg Service", version="0.9.17")
 
 # ============================================
 # CONFIG
@@ -180,11 +180,14 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 # ============================================
 # BASIC HELPERS
 # ============================================
-def run_ffmpeg(args: list) -> tuple:
+def run_ffmpeg(args: list, timeout: int = 60) -> tuple:
     """Run ffmpeg command, return (returncode, stderr)."""
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + args
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    return result.returncode, result.stderr
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.returncode, result.stderr
+    except subprocess.TimeoutExpired:
+        return -1, f"ffmpeg timeout after {timeout}s"
 
 
 def get_duration(filepath: Path) -> float:
@@ -906,7 +909,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.15", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.17", "status": "running"}
 
 
 @app.get("/health")
@@ -2965,14 +2968,15 @@ async def video_concat_endpoint(
             "-filter_complex", filter_chain,
             "-map", video_label,
             "-map", audio_label,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
             "-c:a", "aac", "-b:a", "192k",
             "-ar", "44100", "-ac", "2",
             "-movflags", "+faststart",
             str(output_path)
         ])
         
-        ret, err = run_ffmpeg(cmd)
+        # Concat operations on many clips can take a while - use 10min timeout
+        ret, err = run_ffmpeg(cmd, timeout=600)
         if ret != 0:
             return {
                 "status": "error",
