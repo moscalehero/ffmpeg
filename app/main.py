@@ -1,12 +1,12 @@
 """
-FFmpeg HTTP Service v0.9.11
+FFmpeg HTTP Service v0.9.12
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
-  POST /audio/snap-scenes   - Gap-based quietest-point snap (v0.9.11 default)
+  POST /audio/snap-scenes   - Gap-based quietest-point snap (v0.9.11)
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, edge silence trim)
   POST /video/analyze       - Analyze video's audio track
@@ -14,6 +14,17 @@ Endpoints:
   POST /video/speedup       - Speed up video + audio with constant pitch
   POST /video/merge-audio   - Merge silent video with audio track (v0.9.6)
   POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker
+  POST /video/preset        - Lightroom-style color grading (v0.9.12)
+
+Changelog v0.9.12:
+  - NEW: /video/preset endpoint — Lightroom-style color grading
+  - 8 settings on Lightroom scale (-100 to +100):
+    temp, tint, saturation, exposure, contrast, highlight, shadow, fade
+  - Default preset matches "modern UGC faded" aesthetic:
+    temp=-3, tint=+2, sat=-6, exp=-3, contrast=+12, hl=-35, sh=+18, fade=+6
+  - Audio stream copied unchanged (no re-encode for audio)
+  - Use as final step: ... → /video/optimize → /video/preset → upload
+  - All params optional — call with no body for default UGC preset
 
 Changelog v0.9.11:
   - NEW DEFAULT MODE: gap_quietest
@@ -95,7 +106,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.9.11")
+app = FastAPI(title="FFmpeg Service", version="0.9.12")
 
 # ============================================
 # CONFIG
@@ -876,7 +887,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.11", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.12", "status": "running"}
 
 
 @app.get("/health")
@@ -2424,3 +2435,247 @@ async def video_optimize_endpoint(
         audio_path.unlink(missing_ok=True)
         cut_path.unlink(missing_ok=True)
         final_path.unlink(missing_ok=True)
+
+
+# ============================================
+# v0.9.12 — VIDEO PRESET (color grading)
+# ============================================
+# Lightroom-style color grading filter for video clips.
+# Apply consistent visual treatment across all UGC scenes.
+# ============================================
+
+# Default UGC preset values (Lightroom-style scale: -100 to +100)
+DEFAULT_PRESET = {
+    "temp":       -3,
+    "tint":       2,
+    "saturation": -6,
+    "exposure":   -3,
+    "contrast":   12,
+    "highlight":  -35,
+    "shadow":     18,
+    "fade":       6,
+}
+
+
+def build_color_filter_chain(preset: dict) -> str:
+    """
+    Build ffmpeg filter chain from Lightroom-style preset values.
+    
+    Mappings (Lightroom -100/+100 → ffmpeg specific):
+      - exposure: brightness offset (-1 to +1, scaled by 0.01)
+      - contrast: contrast multiplier (1.0 = no change, ±0.01 per unit)
+      - saturation: saturation multiplier (1.0 = no change, ±0.01 per unit)
+      - temp: cool/warm via b-channel gamma + colorbalance
+              Negative = cooler (more blue), positive = warmer
+      - tint: magenta/green via colorbalance
+              Negative = green, positive = magenta
+      - highlight: reduce highlights via curves
+      - shadow: lift shadows via curves
+      - fade: matte look (raise blacks + lower whites)
+    """
+    filters = []
+    
+    # === STEP 1: Exposure + Contrast + Saturation (eq filter) ===
+    # exposure: -100..+100 → brightness ±0.5
+    brightness = preset.get("exposure", 0) * 0.005
+    # contrast: -100..+100 → multiplier 0.5..1.5
+    contrast = 1.0 + (preset.get("contrast", 0) * 0.01)
+    # saturation: -100..+100 → multiplier 0.0..2.0
+    saturation = 1.0 + (preset.get("saturation", 0) * 0.01)
+    
+    eq_parts = []
+    if abs(brightness) > 0.001:
+        eq_parts.append(f"brightness={brightness:.3f}")
+    if abs(contrast - 1.0) > 0.001:
+        eq_parts.append(f"contrast={contrast:.3f}")
+    if abs(saturation - 1.0) > 0.001:
+        eq_parts.append(f"saturation={saturation:.3f}")
+    
+    if eq_parts:
+        filters.append(f"eq={':'.join(eq_parts)}")
+    
+    # === STEP 2: Temp + Tint (colorbalance filter) ===
+    # temp: -100..+100 → blue-yellow shift (-/+)
+    #   Negative temp = add blue → bs (blue shadow) +
+    #   Positive temp = add yellow → rs (red shadow) + gs minor
+    # tint: -100..+100 → green-magenta shift
+    #   Negative tint = green → gs +
+    #   Positive tint = magenta → rs + bs
+    temp = preset.get("temp", 0)
+    tint = preset.get("tint", 0)
+    
+    if abs(temp) > 0 or abs(tint) > 0:
+        # Scale: ±100 lightroom → ±0.5 colorbalance value (subtle effect)
+        # Apply mostly on midtones (gm) for natural look
+        rm = (temp * 0.003) + (tint * 0.003)         # red midtones
+        gm = -(tint * 0.005)                          # green midtones (inverse for magenta)
+        bm = -(temp * 0.005) + (tint * 0.002)        # blue midtones (inverse for warm)
+        
+        cb_parts = []
+        if abs(rm) > 0.001:
+            cb_parts.append(f"rm={rm:.3f}")
+        if abs(gm) > 0.001:
+            cb_parts.append(f"gm={gm:.3f}")
+        if abs(bm) > 0.001:
+            cb_parts.append(f"bm={bm:.3f}")
+        
+        if cb_parts:
+            filters.append(f"colorbalance={':'.join(cb_parts)}")
+    
+    # === STEP 3: Highlight + Shadow + Fade (curves filter) ===
+    # Build a curve from anchor points
+    highlight = preset.get("highlight", 0)
+    shadow = preset.get("shadow", 0)
+    fade = preset.get("fade", 0)
+    
+    if abs(highlight) > 0 or abs(shadow) > 0 or abs(fade) > 0:
+        # Base curve points (input → output)
+        # Default linear: 0,0 → 0.25,0.25 → 0.5,0.5 → 0.75,0.75 → 1,1
+        
+        # Black point (0,0): lift by fade
+        # Lightroom fade +100 → black point ~0.15
+        black_in = 0.0
+        black_out = max(0.0, fade * 0.0015)  # +6 fade → +0.009 (subtle lift)
+        
+        # Shadow point (0.25, 0.25): lift by shadow
+        # +18 shadow → +0.045 lift (subtle)
+        shadow_in = 0.25
+        shadow_out = 0.25 + (shadow * 0.0025)
+        shadow_out = max(0.0, min(1.0, shadow_out))
+        
+        # Highlight point (0.75, 0.75): pull down by highlight
+        # -35 highlight → -0.0875 (clear reduction)
+        highlight_in = 0.75
+        highlight_out = 0.75 + (highlight * 0.0025)  # negative = pull down
+        highlight_out = max(0.0, min(1.0, highlight_out))
+        
+        # White point (1,1): crushed by fade
+        white_in = 1.0
+        white_out = min(1.0, 1.0 - (fade * 0.0010))  # +6 fade → -0.006 crush
+        
+        # Build curves all_channels for master tonal curve
+        curve_points = (
+            f"{black_in:.3f}/{black_out:.3f} "
+            f"{shadow_in:.3f}/{shadow_out:.3f} "
+            f"{highlight_in:.3f}/{highlight_out:.3f} "
+            f"{white_in:.3f}/{white_out:.3f}"
+        )
+        filters.append(f"curves=all='{curve_points}'")
+    
+    # === STEP 4: Output format compatibility ===
+    filters.append("format=yuv420p")
+    
+    return ",".join(filters) if filters else "null"
+
+
+@app.post("/video/preset")
+async def video_preset_endpoint(
+    file: UploadFile = File(...),
+    temp: float = Form(DEFAULT_PRESET["temp"]),
+    tint: float = Form(DEFAULT_PRESET["tint"]),
+    saturation: float = Form(DEFAULT_PRESET["saturation"]),
+    exposure: float = Form(DEFAULT_PRESET["exposure"]),
+    contrast: float = Form(DEFAULT_PRESET["contrast"]),
+    highlight: float = Form(DEFAULT_PRESET["highlight"]),
+    shadow: float = Form(DEFAULT_PRESET["shadow"]),
+    fade: float = Form(DEFAULT_PRESET["fade"]),
+    auth: str = Depends(verify_token)
+):
+    """
+    Apply Lightroom-style color grading to video.
+    
+    Settings use Lightroom scale (-100 to +100) for intuitive control.
+    Defaults match the standard UGC look (modern faded TikTok aesthetic):
+      temp=-3, tint=+2, saturation=-6, exposure=-3,
+      contrast=+12, highlight=-35, shadow=+18, fade=+6
+    
+    All parameters are optional — sending no params applies the default UGC preset.
+    Audio stream is copied unchanged (no re-encode).
+    
+    Form params (all optional, all -100 to +100):
+      file:       Video file (MP4)
+      temp:       Color temperature (- = cool/blue, + = warm/yellow)
+      tint:       Color tint (- = green, + = magenta)
+      saturation: Color saturation (- = muted, + = punchy)
+      exposure:   Brightness (- = darker, + = brighter)
+      contrast:   Contrast (- = flat, + = punchy)
+      highlight:  Highlight recovery (- = pull down highlights)
+      shadow:     Shadow lift (+ = lift dark areas)
+      fade:       Matte/faded look (+ = lift blacks, crush whites)
+    
+    Pipeline position:
+      Final step before upload — applied AFTER /video/optimize
+      Flow: ... → /video/optimize → /video/preset → upload
+    
+    Returns: Color-graded video as base64 + applied preset values
+    """
+    preset = {
+        "temp":       temp,
+        "tint":       tint,
+        "saturation": saturation,
+        "exposure":   exposure,
+        "contrast":   contrast,
+        "highlight":  highlight,
+        "shadow":     shadow,
+        "fade":       fade,
+    }
+    
+    start_time = time.time()
+    job_id = str(uuid.uuid4())[:8]
+    video_path = WORK_DIR / f"{job_id}_input.mp4"
+    output_path = WORK_DIR / f"{job_id}_graded.mp4"
+    
+    try:
+        content = await file.read()
+        with open(video_path, "wb") as f:
+            f.write(content)
+        
+        original_duration = get_duration(video_path)
+        
+        if original_duration <= 0:
+            raise HTTPException(400, "Invalid video file (zero duration)")
+        
+        # Build the filter chain from preset values
+        filter_chain = build_color_filter_chain(preset)
+        
+        # Apply color grading
+        # Video: re-encode with filter chain
+        # Audio: copy unchanged (much faster)
+        ret, err = run_ffmpeg([
+            "-i", str(video_path),
+            "-vf", filter_chain,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(output_path)
+        ])
+        
+        if ret != 0:
+            return {"status": "error", "error": f"color grading failed: {err[:300]}"}
+        
+        final_duration = get_duration(output_path)
+        
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        
+        # Determine if any non-default values are used
+        is_default = all(preset[k] == DEFAULT_PRESET[k] for k in DEFAULT_PRESET)
+        
+        return {
+            "status": "ok",
+            "preset_used": preset,
+            "is_default_preset": is_default,
+            "filter_chain_applied": filter_chain,
+            "original_duration": round(original_duration, 3),
+            "final_duration": round(final_duration, 3),
+            "video_base64": video_b64,
+            "size_bytes": len(video_bytes),
+            "processing_time_ms": elapsed_ms
+        }
+    
+    finally:
+        video_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
