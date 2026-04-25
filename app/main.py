@@ -13,26 +13,22 @@ Endpoints:
   POST /video/smart-cut     - Auto-trim leading/trailing silence from video
   POST /video/speedup       - Speed up video + audio with constant pitch
   POST /video/merge-audio   - Merge silent video with audio track (v0.9.6)
-  POST /video/optimize      - Combined: smart-cut + auto-speedup if slow speaker
+  POST /video/optimize      - Combined: smart-cut + auto-speedup + end-padding + audio fade-out
   POST /video/preset        - Lightroom-style color grading (v0.9.12)
-  POST /video/concat        - Concat multiple clips with fade transitions (v0.9.13)
-  POST /video/concat-urls   - Same as /video/concat but takes URLs as JSON (v0.9.14)
 
-Changelog v0.9.14:
-  - NEW: /video/concat-urls endpoint — JSON body with URL array instead of multi-file upload
-  - Much easier from n8n: takes JSON body with `video_urls` (or `urls`) array
-  - Server downloads videos directly from URLs (e.g. MinIO)
-  - Same internal logic as /video/concat (build_concat_filter_chain)
-  - Both endpoints coexist — use whichever fits your use case
+Changelog v0.10.1:
+  - CHANGED: Trailing trim buffer 25ms → 50ms (symmetric with leading)
+  - CHANGED: /video/optimize now applies audio-only fade-in/out (no padding,
+    no video fade). Video remains stream-copied (lossless + fast).
+  - Audio fade happens mostly over the trim buffer zone (where audio is mostly
+    silent), with minimal touch on speech edges.
+  - When scenes are concatenated downstream, audio bridges smoothly.
 
-Changelog v0.9.13:
-  - NEW: /video/concat endpoint — multi-clip concat with crossfade transitions
-  - Equivalent to CapCut's "mix" transition between scenes
-  - Default 0.1s fade transition with audio crossfade
-  - Whitelisted ~20 transition types (fade, dissolve, wipe*, slide*, circle*, etc.)
-  - Cumulative offset calculation for chained xfade filters
-  - Final duration = sum(clips) - (N-1) * transition_duration
-  - All params optional except files[]
+Changelog v0.10.0:
+  - REMOVED: /video/concat endpoint (replaced by external service for assembly)
+  - Per-scene processing only — clean main.py
+  - Removed: build_concat_filter_chain helper, ConcatRequest model
+
 
 Changelog v0.9.12:
   - NEW: /video/preset endpoint — Lightroom-style color grading
@@ -119,13 +115,12 @@ import re
 import shutil
 import urllib.request
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
 
-app = FastAPI(title="FFmpeg Service", version="0.9.17")
+app = FastAPI(title="FFmpeg Service", version="0.10.1")
 
 # ============================================
 # CONFIG
@@ -165,7 +160,7 @@ DENSITY_NORMAL = 0.70
 # Edge silence (v0.8.1) - always trim leading/trailing silence
 EDGE_SILENCE_MIN_MS = 50              # trim edges only if they exceed this
 EDGE_SILENCE_KEEP_LEADING_MS = 50     # buffer at start (natural fade-in)
-EDGE_SILENCE_KEEP_TRAILING_MS = 25    # buffer at end (tight cut, avoid blink-tails)
+EDGE_SILENCE_KEEP_TRAILING_MS = 50    # buffer at end (symmetric with leading)
 EDGE_SILENCE_KEEP_MS = 50             # legacy fallback (kept for compatibility)
 EDGE_TOLERANCE = 0.05                 # tolerance for detecting edge position (50ms)
 
@@ -909,7 +904,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.17", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.10.1", "status": "running"}
 
 
 @app.get("/health")
@@ -1676,6 +1671,66 @@ def cut_video_segment(input_path: Path, output_path: Path, start: float, end: fl
     ])
 
 
+def add_audio_fade(
+    input_path: Path,
+    output_path: Path,
+    fade_in_ms: int = 50,
+    fade_out_ms: int = 50,
+) -> tuple:
+    """
+    Apply audio-only fade-in at start and fade-out at end of video.
+    
+    v0.10.1: Used as final step in /video/optimize to ensure smooth audio
+    transitions when scenes are concatenated downstream.
+    
+    Behavior:
+      - Audio: fade-in over first {fade_in_ms} + fade-out over last {fade_out_ms}
+      - Video: completely unchanged (stream-copied for speed)
+      - Fade happens mostly over the trim buffer zone (where audio is mostly
+        silent anyway), with minimal touch on speech edges.
+    
+    When scenes are concatenated downstream:
+      Scene 1: [...content...][fade-out] | Scene 2: [fade-in][...content...]
+                              ^                   ^
+                              audio bridges smoothly between scenes
+    
+    Args:
+        input_path: source video
+        output_path: destination video with audio fades
+        fade_in_ms: fade-in duration at start (default 50ms)
+        fade_out_ms: fade-out duration at end (default 50ms)
+    
+    Returns:
+        (returncode, stderr)
+    """
+    duration = get_duration(input_path)
+    if duration <= 0:
+        return -1, "invalid input duration"
+    
+    fade_in_s = fade_in_ms / 1000
+    fade_out_s = fade_out_ms / 1000
+    
+    # Fade-out starts at (duration - fade_out_s)
+    fade_out_start = max(0, duration - fade_out_s)
+    
+    # Audio filter: fade-in from 0, fade-out to end
+    audio_filter = (
+        f"afade=t=in:st=0:d={fade_in_s:.3f},"
+        f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_s:.3f}"
+    )
+    
+    # Video stream-copied (no re-encode = fast + lossless)
+    # Audio re-encoded with fade filters
+    return run_ffmpeg([
+        "-i", str(input_path),
+        "-c:v", "copy",
+        "-af", audio_filter,
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ])
+
+
 def speedup_video(input_path: Path, output_path: Path, speed: float) -> tuple:
     """
     Speed up video+audio with constant pitch.
@@ -2402,7 +2457,7 @@ async def video_optimize_endpoint(
                 cut_path.unlink(missing_ok=True)
             current_path = final_path
         
-        # If no operation applied, use original
+        # If no operation applied, use original (need to copy for next step)
         if current_path == video_path:
             shutil.copy(video_path, final_path)
             current_path = final_path
@@ -2410,6 +2465,21 @@ async def video_optimize_endpoint(
             # Move cut result to final
             current_path.rename(final_path)
             current_path = final_path
+        
+        # Step 5: Apply audio fade-in/fade-out (v0.10.1)
+        # Audio-only: video remains unchanged (stream-copied)
+        # Ensures smooth audio at scene boundaries when concatenated downstream
+        faded_path = WORK_DIR / f"{job_id}_faded.mp4"
+        ret, err = add_audio_fade(
+            final_path, faded_path,
+            fade_in_ms=50,
+            fade_out_ms=50,
+        )
+        if ret != 0:
+            return {"status": "error", "error": f"audio fade failed: {err[:200]}"}
+        
+        final_path.unlink(missing_ok=True)
+        faded_path.rename(final_path)
         
         final_duration = get_duration(final_path)
         
@@ -2700,320 +2770,4 @@ async def video_preset_endpoint(
     
     finally:
         video_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
-
-
-# ============================================
-# v0.9.13 — VIDEO CONCAT WITH TRANSITIONS
-# ============================================
-# Concatenate multiple video clips with smooth fade transitions
-# (CapCut-style "mix" transition between scenes).
-# ============================================
-
-def build_concat_filter_chain(
-    clip_durations: list,
-    transition_duration: float,
-    transition_type: str = "fade",
-    audio_crossfade: bool = True,
-    target_fps: int = 25,
-    target_resolution: str = "1080:1920",
-) -> tuple:
-    """
-    Build ffmpeg filter_complex chain for chained xfade transitions.
-    
-    v0.9.15: Added fps + resolution normalization to prevent frame rate
-    mismatch errors when input clips have different fps (e.g. mix of 24fps
-    and 27.58fps clips after speedup re-encoding).
-    
-    For N clips: builds N-1 nested xfade filters with cumulative offsets.
-    Each input is first normalized: scale + fps + setsar=1 + format=yuv420p
-    
-    Args:
-        clip_durations: list of duration (seconds) for each input clip
-        transition_duration: length of each crossfade in seconds (e.g. 0.1)
-        transition_type: xfade transition name ('fade', 'fadeblack', 'dissolve', etc.)
-        audio_crossfade: whether to also crossfade audio (vs hard cut)
-        target_fps: target frame rate for all clips (default 25 for UGC PAL)
-        target_resolution: target resolution as "W:H" (default 1080:1920 for vertical)
-    
-    Returns:
-        (filter_complex_string, output_video_label, output_audio_label)
-    """
-    n = len(clip_durations)
-    if n < 2:
-        raise ValueError("Need at least 2 clips to concat")
-    
-    video_filters = []
-    audio_filters = []
-    
-    # ============================================
-    # STEP 0: Normalize each input video
-    # Forces same fps, resolution, SAR, pixel format on every clip
-    # so xfade doesn't crash on mismatch
-    # ============================================
-    for i in range(n):
-        video_filters.append(
-            f"[{i}:v]scale={target_resolution}:force_original_aspect_ratio=decrease,"
-            f"pad={target_resolution}:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"fps={target_fps},setsar=1,format=yuv420p[v{i}_norm]"
-        )
-    
-    # ============================================
-    # STEP 1: Build xfade chain using normalized inputs
-    # ============================================
-    cumulative_duration = 0.0
-    for i in range(n - 1):
-        # Track cumulative output duration BEFORE this transition
-        if i == 0:
-            cumulative_duration = clip_durations[0]
-            input_label = "[v0_norm]"
-        else:
-            cumulative_duration += clip_durations[i]
-            input_label = f"[v{i}_chain]"
-        
-        offset = cumulative_duration - transition_duration * (i + 1)
-        next_clip_label = f"[v{i + 1}_norm]"
-        
-        # Output label: 'vout' for last, 'v{i+1}_chain' for intermediate
-        if i == n - 2:
-            output_label = "[vout]"
-        else:
-            output_label = f"[v{i + 1}_chain]"
-        
-        video_filters.append(
-            f"{input_label}{next_clip_label}xfade="
-            f"transition={transition_type}:duration={transition_duration:.3f}:offset={offset:.3f}{output_label}"
-        )
-    
-    # ============================================
-    # STEP 2: Build audio chain
-    # Audio sample rate normalization is handled in the main ffmpeg cmd via -ar
-    # ============================================
-    audio_output_label = None
-    if audio_crossfade:
-        # Use acrossfade for smooth audio transitions
-        for i in range(n - 1):
-            input_label = "[0:a]" if i == 0 else f"[a{i}]"
-            next_clip_label = f"[{i + 1}:a]"
-            
-            if i == n - 2:
-                output_label = "[aout]"
-            else:
-                output_label = f"[a{i + 1}]"
-            
-            audio_filters.append(
-                f"{input_label}{next_clip_label}acrossfade="
-                f"d={transition_duration:.3f}{output_label}"
-            )
-        audio_output_label = "[aout]"
-    else:
-        # Hard cut audio: use concat filter
-        audio_inputs = "".join(f"[{i}:a]" for i in range(n))
-        audio_filters.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
-        audio_output_label = "[aout]"
-    
-    # Combine all filters
-    all_filters = video_filters + audio_filters
-    filter_chain = ";".join(all_filters)
-    
-    return filter_chain, "[vout]", audio_output_label
-
-
-class ConcatRequest(BaseModel):
-    """Request body for /video/concat endpoint (JSON)."""
-    video_urls: Optional[List[str]] = None
-    urls: Optional[List[str]] = None  # alias for 'video_urls' (backward compat)
-    transition_duration: float = 0.1
-    transition_type: str = "fade"
-    audio_crossfade: bool = True
-
-
-@app.post("/video/concat")
-async def video_concat_endpoint(
-    request: ConcatRequest,
-    auth: str = Depends(verify_token)
-):
-    """
-    Concatenate multiple video clips with smooth fade transitions between scenes.
-    
-    Equivalent to CapCut's "mix" transition feature with configurable duration.
-    
-    Takes a JSON array of URLs (e.g. MinIO public URLs) — server downloads
-    each video sequentially in playback order.
-    
-    JSON body:
-      {
-        "video_urls": [
-          "https://minio.example.com/bucket/scene_1.mp4",
-          "https://minio.example.com/bucket/scene_2.mp4",
-          ...
-        ],
-        "transition_duration": 0.1,    // optional, default 0.1
-        "transition_type": "fade",      // optional, default 'fade'
-        "audio_crossfade": true         // optional, default true
-      }
-    
-    Body params:
-      video_urls (or urls): Array of video URLs in playback order (REQUIRED)
-      transition_duration:  Length of crossfade in seconds (default 0.1)
-      transition_type:      xfade transition name (default 'fade')
-                            Options: fade, fadeblack, fadewhite, dissolve,
-                                     wipeleft, wiperight, wipeup, wipedown,
-                                     slideleft, slideright, slideup, slidedown,
-                                     circleopen, circleclose, etc.
-      audio_crossfade:      Whether to crossfade audio (true) or hard cut (false)
-    
-    Behavior:
-      - Final duration = sum(durations) - (N-1) * transition_duration
-      - All clips must have compatible video formats (resolution, codec)
-      - Auto-resamples audio to 44100Hz stereo for compatibility
-      - Order is preserved — make sure your URL array is in correct order
-    
-    Pipeline position:
-      Final assembly step — combines individually optimized scene clips
-      Flow: ... -> /video/preset (per scene) -> /video/concat (assemble) -> upload
-    
-    Returns: Combined video as base64 + concat metadata
-    """
-    # Accept both 'video_urls' and 'urls'
-    urls = request.video_urls or request.urls
-    if not urls:
-        raise HTTPException(400, "Must provide 'video_urls' (or 'urls') array in JSON body")
-    
-    transition_duration = request.transition_duration
-    transition_type = request.transition_type
-    audio_crossfade = request.audio_crossfade
-    
-    if len(urls) < 2:
-        raise HTTPException(400, "Need at least 2 video URLs to concat")
-    
-    if transition_duration < 0 or transition_duration > 5:
-        raise HTTPException(400, "transition_duration must be between 0 and 5 seconds")
-    
-    # Whitelist of common transition types
-    valid_transitions = {
-        "fade", "fadeblack", "fadewhite", "dissolve", "pixelize",
-        "wipeleft", "wiperight", "wipeup", "wipedown",
-        "slideleft", "slideright", "slideup", "slidedown",
-        "circleopen", "circleclose", "rectcrop", "circlecrop",
-        "smoothleft", "smoothright", "smoothup", "smoothdown",
-        "radial", "horzopen", "horzclose", "vertopen", "vertclose",
-    }
-    if transition_type not in valid_transitions:
-        raise HTTPException(
-            400,
-            f"Unknown transition_type '{transition_type}'. "
-            f"Valid: {', '.join(sorted(valid_transitions))}"
-        )
-    
-    start_time = time.time()
-    download_start = time.time()
-    job_id = str(uuid.uuid4())[:8]
-    input_paths = []
-    output_path = WORK_DIR / f"{job_id}_concat.mp4"
-    
-    try:
-        # Step 1: Download all videos from URLs (in order)
-        clip_durations = []
-        download_info = []
-        
-        for i, url in enumerate(urls):
-            input_path = WORK_DIR / f"{job_id}_clip{i:03d}.mp4"
-            input_paths.append(input_path)
-            
-            try:
-                urllib.request.urlretrieve(url, input_path)
-            except Exception as e:
-                raise HTTPException(400, f"Failed to download URL {i} ({url}): {e}")
-            
-            duration = get_duration(input_path)
-            if duration <= 0:
-                raise HTTPException(400, f"Clip {i} (from URL) has invalid duration")
-            
-            # Sanity check: clip must be longer than transition
-            if duration <= transition_duration:
-                raise HTTPException(
-                    400,
-                    f"Clip {i} duration ({duration:.2f}s) must be longer than "
-                    f"transition_duration ({transition_duration:.2f}s)"
-                )
-            
-            clip_durations.append(duration)
-            download_info.append({
-                "index": i,
-                "url": url,
-                "duration": round(duration, 3),
-                "size_bytes": input_path.stat().st_size,
-            })
-        
-        download_time_ms = int((time.time() - download_start) * 1000)
-        
-        # Step 2: Build filter chain
-        filter_chain, video_label, audio_label = build_concat_filter_chain(
-            clip_durations,
-            transition_duration,
-            transition_type,
-            audio_crossfade,
-        )
-        
-        # Calculate expected output duration
-        expected_duration = sum(clip_durations) - (len(clip_durations) - 1) * transition_duration
-        
-        # Step 3: Build ffmpeg command
-        cmd = []
-        for path in input_paths:
-            cmd.extend(["-i", str(path)])
-        
-        cmd.extend([
-            "-filter_complex", filter_chain,
-            "-map", video_label,
-            "-map", audio_label,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
-            "-c:a", "aac", "-b:a", "192k",
-            "-ar", "44100", "-ac", "2",
-            "-movflags", "+faststart",
-            str(output_path)
-        ])
-        
-        # Concat operations on many clips can take a while - use 10min timeout
-        ret, err = run_ffmpeg(cmd, timeout=600)
-        if ret != 0:
-            return {
-                "status": "error",
-                "error": f"concat failed: {err[:300]}",
-                "filter_chain": filter_chain,
-                "downloads": download_info,
-            }
-        
-        final_duration = get_duration(output_path)
-        
-        with open(output_path, "rb") as f:
-            video_bytes = f.read()
-        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
-        
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        encoding_time_ms = elapsed_ms - download_time_ms
-        
-        return {
-            "status": "ok",
-            "input_count": len(urls),
-            "transitions_applied": len(urls) - 1,
-            "transition_type": transition_type,
-            "transition_duration": transition_duration,
-            "audio_crossfade": audio_crossfade,
-            "input_durations": [round(d, 3) for d in clip_durations],
-            "expected_duration": round(expected_duration, 3),
-            "final_duration": round(final_duration, 3),
-            "downloads": download_info,
-            "filter_chain_applied": filter_chain,
-            "video_base64": video_b64,
-            "size_bytes": len(video_bytes),
-            "download_time_ms": download_time_ms,
-            "encoding_time_ms": encoding_time_ms,
-            "processing_time_ms": elapsed_ms,
-        }
-    
-    finally:
-        for path in input_paths:
-            path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
