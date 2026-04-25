@@ -119,10 +119,11 @@ import re
 import shutil
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 
 app = FastAPI(title="FFmpeg Service", version="0.9.14")
 
@@ -2804,12 +2805,18 @@ def build_concat_filter_chain(
     return filter_chain, "[vout]", audio_output_label
 
 
+class ConcatRequest(BaseModel):
+    """Request body for /video/concat endpoint (JSON)."""
+    video_urls: Optional[List[str]] = None
+    urls: Optional[List[str]] = None  # alias for 'video_urls' (backward compat)
+    transition_duration: float = 0.1
+    transition_type: str = "fade"
+    audio_crossfade: bool = True
+
+
 @app.post("/video/concat")
 async def video_concat_endpoint(
-    files: list[UploadFile] = File(..., description="Video clips to concatenate (MP4)"),
-    transition_duration: float = Form(0.1),
-    transition_type: str = Form("fade"),
-    audio_crossfade: bool = Form(True),
+    request: ConcatRequest,
     auth: str = Depends(verify_token)
 ):
     """
@@ -2817,29 +2824,54 @@ async def video_concat_endpoint(
     
     Equivalent to CapCut's "mix" transition feature with configurable duration.
     
-    Form params:
-      files:               Multiple video files (in playback order)
-      transition_duration: Length of crossfade in seconds (default 0.1)
-      transition_type:     xfade transition name (default 'fade')
-                           Options: fade, fadeblack, fadewhite, dissolve,
-                                    wipeleft, wiperight, wipeup, wipedown,
-                                    slideleft, slideright, slideup, slidedown,
-                                    circleopen, circleclose, etc.
-      audio_crossfade:     Whether to crossfade audio (true) or hard cut (false)
+    Takes a JSON array of URLs (e.g. MinIO public URLs) — server downloads
+    each video sequentially in playback order.
+    
+    JSON body:
+      {
+        "video_urls": [
+          "https://minio.example.com/bucket/scene_1.mp4",
+          "https://minio.example.com/bucket/scene_2.mp4",
+          ...
+        ],
+        "transition_duration": 0.1,    // optional, default 0.1
+        "transition_type": "fade",      // optional, default 'fade'
+        "audio_crossfade": true         // optional, default true
+      }
+    
+    Body params:
+      video_urls (or urls): Array of video URLs in playback order (REQUIRED)
+      transition_duration:  Length of crossfade in seconds (default 0.1)
+      transition_type:      xfade transition name (default 'fade')
+                            Options: fade, fadeblack, fadewhite, dissolve,
+                                     wipeleft, wiperight, wipeup, wipedown,
+                                     slideleft, slideright, slideup, slidedown,
+                                     circleopen, circleclose, etc.
+      audio_crossfade:      Whether to crossfade audio (true) or hard cut (false)
     
     Behavior:
       - Final duration = sum(durations) - (N-1) * transition_duration
       - All clips must have compatible video formats (resolution, codec)
       - Auto-resamples audio to 44100Hz stereo for compatibility
+      - Order is preserved — make sure your URL array is in correct order
     
     Pipeline position:
       Final assembly step — combines individually optimized scene clips
-      Flow: ... → /video/preset (per scene) → /video/concat (assemble) → upload
+      Flow: ... -> /video/preset (per scene) -> /video/concat (assemble) -> upload
     
     Returns: Combined video as base64 + concat metadata
     """
-    if len(files) < 2:
-        raise HTTPException(400, "Need at least 2 files to concat")
+    # Accept both 'video_urls' and 'urls'
+    urls = request.video_urls or request.urls
+    if not urls:
+        raise HTTPException(400, "Must provide 'video_urls' (or 'urls') array in JSON body")
+    
+    transition_duration = request.transition_duration
+    transition_type = request.transition_type
+    audio_crossfade = request.audio_crossfade
+    
+    if len(urls) < 2:
+        raise HTTPException(400, "Need at least 2 video URLs to concat")
     
     if transition_duration < 0 or transition_duration > 5:
         raise HTTPException(400, "transition_duration must be between 0 and 5 seconds")
@@ -2861,24 +2893,28 @@ async def video_concat_endpoint(
         )
     
     start_time = time.time()
+    download_start = time.time()
     job_id = str(uuid.uuid4())[:8]
     input_paths = []
     output_path = WORK_DIR / f"{job_id}_concat.mp4"
     
     try:
-        # Save all uploaded files
+        # Step 1: Download all videos from URLs (in order)
         clip_durations = []
-        for i, upload in enumerate(files):
+        download_info = []
+        
+        for i, url in enumerate(urls):
             input_path = WORK_DIR / f"{job_id}_clip{i:03d}.mp4"
             input_paths.append(input_path)
             
-            content = await upload.read()
-            with open(input_path, "wb") as f:
-                f.write(content)
+            try:
+                urllib.request.urlretrieve(url, input_path)
+            except Exception as e:
+                raise HTTPException(400, f"Failed to download URL {i} ({url}): {e}")
             
             duration = get_duration(input_path)
             if duration <= 0:
-                raise HTTPException(400, f"Clip {i} has invalid duration")
+                raise HTTPException(400, f"Clip {i} (from URL) has invalid duration")
             
             # Sanity check: clip must be longer than transition
             if duration <= transition_duration:
@@ -2889,8 +2925,16 @@ async def video_concat_endpoint(
                 )
             
             clip_durations.append(duration)
+            download_info.append({
+                "index": i,
+                "url": url,
+                "duration": round(duration, 3),
+                "size_bytes": input_path.stat().st_size,
+            })
         
-        # Build filter chain
+        download_time_ms = int((time.time() - download_start) * 1000)
+        
+        # Step 2: Build filter chain
         filter_chain, video_label, audio_label = build_concat_filter_chain(
             clip_durations,
             transition_duration,
@@ -2901,7 +2945,7 @@ async def video_concat_endpoint(
         # Calculate expected output duration
         expected_duration = sum(clip_durations) - (len(clip_durations) - 1) * transition_duration
         
-        # Build ffmpeg command
+        # Step 3: Build ffmpeg command
         cmd = []
         for path in input_paths:
             cmd.extend(["-i", str(path)])
@@ -2923,6 +2967,7 @@ async def video_concat_endpoint(
                 "status": "error",
                 "error": f"concat failed: {err[:300]}",
                 "filter_chain": filter_chain,
+                "downloads": download_info,
             }
         
         final_duration = get_duration(output_path)
@@ -2932,20 +2977,24 @@ async def video_concat_endpoint(
         video_b64 = base64.b64encode(video_bytes).decode("utf-8")
         
         elapsed_ms = int((time.time() - start_time) * 1000)
+        encoding_time_ms = elapsed_ms - download_time_ms
         
         return {
             "status": "ok",
-            "input_count": len(files),
-            "transitions_applied": len(files) - 1,
+            "input_count": len(urls),
+            "transitions_applied": len(urls) - 1,
             "transition_type": transition_type,
             "transition_duration": transition_duration,
             "audio_crossfade": audio_crossfade,
             "input_durations": [round(d, 3) for d in clip_durations],
             "expected_duration": round(expected_duration, 3),
             "final_duration": round(final_duration, 3),
+            "downloads": download_info,
             "filter_chain_applied": filter_chain,
             "video_base64": video_b64,
             "size_bytes": len(video_bytes),
+            "download_time_ms": download_time_ms,
+            "encoding_time_ms": encoding_time_ms,
             "processing_time_ms": elapsed_ms,
         }
     
