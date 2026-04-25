@@ -125,7 +125,7 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-app = FastAPI(title="FFmpeg Service", version="0.9.14")
+app = FastAPI(title="FFmpeg Service", version="0.9.15")
 
 # ============================================
 # CONFIG
@@ -906,7 +906,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.9.14", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.9.15", "status": "running"}
 
 
 @app.get("/health")
@@ -2712,30 +2712,29 @@ def build_concat_filter_chain(
     transition_duration: float,
     transition_type: str = "fade",
     audio_crossfade: bool = True,
+    target_fps: int = 25,
+    target_resolution: str = "1080:1920",
 ) -> tuple:
     """
     Build ffmpeg filter_complex chain for chained xfade transitions.
     
+    v0.9.15: Added fps + resolution normalization to prevent frame rate
+    mismatch errors when input clips have different fps (e.g. mix of 24fps
+    and 27.58fps clips after speedup re-encoding).
+    
     For N clips: builds N-1 nested xfade filters with cumulative offsets.
+    Each input is first normalized: scale + fps + setsar=1 + format=yuv420p
     
     Args:
         clip_durations: list of duration (seconds) for each input clip
         transition_duration: length of each crossfade in seconds (e.g. 0.1)
         transition_type: xfade transition name ('fade', 'fadeblack', 'dissolve', etc.)
         audio_crossfade: whether to also crossfade audio (vs hard cut)
+        target_fps: target frame rate for all clips (default 25 for UGC PAL)
+        target_resolution: target resolution as "W:H" (default 1080:1920 for vertical)
     
     Returns:
         (filter_complex_string, output_video_label, output_audio_label)
-        
-    Example for 3 clips of 3s each with 0.1s fade:
-        offsets[0] = 3.0 - 0.1 = 2.9
-        offsets[1] = (3.0 + 3.0) - 2*0.1 = 5.8
-        
-        filter:
-          [0:v][1:v]xfade=transition=fade:duration=0.1:offset=2.9[v1];
-          [v1][2:v]xfade=transition=fade:duration=0.1:offset=5.8[vout];
-          [0:a][1:a]acrossfade=d=0.1[a1];
-          [a1][2:a]acrossfade=d=0.1[aout]
     """
     n = len(clip_durations)
     if n < 2:
@@ -2744,37 +2743,49 @@ def build_concat_filter_chain(
     video_filters = []
     audio_filters = []
     
-    # Calculate cumulative offsets
-    # offset[i] is when xfade between clip[i] and clip[i+1] should START
-    # For first xfade: offset = duration[0] - transition_duration
-    # For subsequent: offset = sum(durations[0..i]) - (i+1) * transition_duration
+    # ============================================
+    # STEP 0: Normalize each input video
+    # Forces same fps, resolution, SAR, pixel format on every clip
+    # so xfade doesn't crash on mismatch
+    # ============================================
+    for i in range(n):
+        video_filters.append(
+            f"[{i}:v]scale={target_resolution}:force_original_aspect_ratio=decrease,"
+            f"pad={target_resolution}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={target_fps},setsar=1,format=yuv420p[v{i}_norm]"
+        )
     
-    # Build video xfade chain
+    # ============================================
+    # STEP 1: Build xfade chain using normalized inputs
+    # ============================================
     cumulative_duration = 0.0
     for i in range(n - 1):
         # Track cumulative output duration BEFORE this transition
         if i == 0:
             cumulative_duration = clip_durations[0]
-            input_label = "[0:v]"
+            input_label = "[v0_norm]"
         else:
             cumulative_duration += clip_durations[i]
-            input_label = f"[v{i}]"
+            input_label = f"[v{i}_chain]"
         
         offset = cumulative_duration - transition_duration * (i + 1)
-        next_clip_label = f"[{i + 1}:v]"
+        next_clip_label = f"[v{i + 1}_norm]"
         
-        # Output label: 'vout' for last, 'v{i+1}' for intermediate
+        # Output label: 'vout' for last, 'v{i+1}_chain' for intermediate
         if i == n - 2:
             output_label = "[vout]"
         else:
-            output_label = f"[v{i + 1}]"
+            output_label = f"[v{i + 1}_chain]"
         
         video_filters.append(
             f"{input_label}{next_clip_label}xfade="
             f"transition={transition_type}:duration={transition_duration:.3f}:offset={offset:.3f}{output_label}"
         )
     
-    # Build audio chain
+    # ============================================
+    # STEP 2: Build audio chain
+    # Audio sample rate normalization is handled in the main ffmpeg cmd via -ar
+    # ============================================
     audio_output_label = None
     if audio_crossfade:
         # Use acrossfade for smooth audio transitions
@@ -2798,7 +2809,7 @@ def build_concat_filter_chain(
         audio_filters.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
         audio_output_label = "[aout]"
     
-    # Combine
+    # Combine all filters
     all_filters = video_filters + audio_filters
     filter_chain = ";".join(all_filters)
     
