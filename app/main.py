@@ -1,12 +1,12 @@
 """
-FFmpeg HTTP Service v0.12.1
+FFmpeg HTTP Service v0.13.0
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
-  POST /audio/snap-scenes   - Burst-aware gap analysis (v0.12.1)
+  POST /audio/snap-scenes   - Peak-detection cut algorithm (v0.13.0)
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, edge silence trim)
   POST /video/analyze       - Analyze video's audio track
@@ -16,40 +16,42 @@ Endpoints:
   POST /video/optimize      - Combined: smart-cut + auto-speedup + audio fade-in/out
   POST /video/preset        - Lightroom-style color grading (v0.9.12)
 
-Changelog v0.12.1:
-  - FIXED: "good" → "goo" plosive bug. The v0.12.0 logic for the
-    after_prev_word case incorrectly clamped the cut to next_start - 5ms,
-    even when the plosive burst extended past next_start. This caused
-    the d/t/p/b/k/g decay tail to be cut off and bleed into the next
-    scene's MP3.
-  - NEW LOGIC: When the algorithm detects the prev word's burst extends
-    past next_start (e.g. "good." + tight "Burning" = 60ms gap with
-    80ms d-burst), the cut is placed AFTER the burst ends. This keeps
-    the plosive intact at the cost of a small bite into the next word's
-    onset (typically 10-20ms, barely audible).
-  - CHANGED: Fallback cases (very_short_gap, no_rms_data, no_silence)
-    now use ElevenLabs midpoint instead of hard next_start - 5ms cut.
-    Hard next_start cuts consistently produced bleeding artifacts.
+Changelog v0.13.0:
+  - FIXED: "good" was being cut MID-WORD because v0.12.x naively treated
+    the first RMS-dip as word-end. But words have natural energy dips
+    INSIDE them (e.g. between /g/-/ʊ/-/d/ phonemes in "good"). The dip
+    between the vowel and the final /d/ stop-closure was being mistaken
+    for the word's end → cut at "go-|-od" with "od" leaking into next scene.
+  - NEW APPROACH (peak detection):
+    * Find ALL peaks in the gap window (chunks with RMS > floor + 6dB)
+    * Walk BACKWARD through peaks
+    * For each peak, check if SUSTAINED silence follows (≥30ms below floor
+      without speech recovery)
+    * Mid-word dips are followed by MORE speech → filtered out
+    * Real word-end has sustained silence → that's where we cut
+    * Cut 20ms after the real peak (decay tail grace)
+  - WIDER SEARCH WINDOW: prev_end - 30ms to next_start + 200ms
+    (was 10/30 in v0.12 — too narrow, ElevenLabs timestamps are
+    systematically 50-100ms early on plosive endings)
+  - FINER GRANULARITY: 5ms RMS chunks (was 10ms in v0.12)
   - New cut_reason values:
-    * "overlap_priorize_prev" — burst overlap detected, kept full prev word
-    * "after_prev_word" — burst extends past next_start, cut after burst
-    * "no_silence_midpoint_fallback" — no silence found, use midpoint
-    * "very_short_gap_midpoint" — gap <30ms, use midpoint
-    * "no_rms_data_midpoint" — measurement failed, use midpoint
+    * "after_last_real_peak" — found word-end with silence after it (BEST)
+    * "no_peaks_midpoint" — no clear speech in window (fallback)
+    * "no_sustained_silence_cut_late" — speech extends through window
+    * "window_too_small_midpoint" — gap analysis impossible
+    * "no_rms_data_midpoint" — RMS measurement failed
+  - New debug fields: peak_position, sustained_silence_after_ms
 
-Changelog v0.12.0:
-  - FIXED: snap-scenes was systematically cutting 200-500ms past prev_end,
-    causing the next word's beginning to bleed into the previous scene.
-  - ROOT CAUSE: v0.11.0 computed speech_floor from a 280ms window (mostly
-    silence in short gaps), giving an absurdly low floor (-50dB+) that
-    made the algorithm think speech extended way past prev_end.
-  - NEW APPROACH (global_floor mode):
-    * Speech floor computed ONCE from the whole audio (mean_db - 15)
-    * Conservative search window: prev_end - 10ms to next_start + 30ms
-    * Walk forward: find where prev word's energy drops below floor
-    * Walk backward: find where next word's energy rises above floor
-    * Cut in middle of detected silence
-  - SUPERSEDED by v0.12.1 (burst-aware fixes)
+Changelog v0.12.1 (SUPERSEDED by v0.13.0):
+  - Fixed after_prev_word clamp bug from v0.12.0, but the underlying
+    "first RMS dip = word-end" assumption was still wrong for words
+    with internal dips like "good". Replaced with peak detection in v0.13.
+
+Changelog v0.12.0 (SUPERSEDED):
+  - Switched from per-window to global speech_floor.
+  - Conservative search window prev_end - 10ms to next_start + 30ms.
+  - Walk forward from prev_end + 5ms to find silence start.
+  - Naive "first dip = word-end" — wrong for words with internal dips.
 
 Changelog v0.10.1:
   - CHANGED: Trailing trim buffer 25ms → 50ms (symmetric with leading)
@@ -154,7 +156,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.12.1")
+app = FastAPI(title="FFmpeg Service", version="0.13.0")
 
 # ============================================
 # CONFIG
@@ -938,7 +940,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.12.1", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.13.0", "status": "running"}
 
 
 @app.get("/health")
@@ -1096,27 +1098,38 @@ def find_gap_quietest(
     audio_duration: float,
     global_speech_floor_db: float,
     buffer_ms: int = 100,
-    chunk_ms: int = 10,
-    back_buffer_ms: int = 10,
-    forward_buffer_ms: int = 30,
-    edge_skip_ms: int = 5,
+    chunk_ms: int = 5,
+    back_buffer_ms: int = 30,
+    forward_buffer_ms: int = 200,
+    min_silence_after_peak_ms: int = 30,
+    decay_tail_ms: int = 20,
+    peak_threshold_offset_db: float = 6.0,
 ) -> dict:
     """
-    Find the cut point in the gap between two scenes (v0.12.0 — global floor).
+    Find the cut point in the gap between two scenes (v0.13.0 — peak detection).
 
-    NEW APPROACH vs v0.11.0:
-      - Speech floor is GLOBAL (passed in), computed once from whole audio
-        as mean_db - 15. Was computed per-window in v0.11.0, which was
-        unreliable in short gaps where most of the window IS silence.
-      - Conservative search window: prev_end - 10ms to next_start + 30ms
-        (was prev_end - 30ms to next_start + 250ms in v0.11.0, way too wide)
-      - Walk forward from prev_end + 5ms: find where energy drops below floor
-        → that's the actual end of the previous word (incl. plosive decay)
-      - Walk backward from next_start - 5ms: find where energy rises above
-        floor → that's the actual start of the next word
-      - Cut in the middle of the detected silence span
-      - If silences overlap (plosive burst extends past next_start):
-        cut at next_start - 5ms (priorizes clean next-word start)
+    KEY INSIGHT vs v0.12.x:
+      Words have RMS-dips INSIDE them (e.g. between /g/-/ʊ/-/d/ in "good"),
+      not just at their end. v0.12.x naively treated the first dip as
+      word-end → cut MID-WORD on words like "good" → "go" + "od" bleed.
+
+    v0.13.0 APPROACH:
+      Don't look for "where does silence start", but for "where is the
+      LAST loud peak that has SUSTAINED silence after it". A real word-end
+      requires the dip to persist for at least 30ms. Mid-word dips are
+      followed by more speech (the next phoneme), so they're filtered out.
+
+    Algorithm:
+      1. Generous window: prev_end - 30ms to next_start + 200ms
+         (ElevenLabs timestamps are systematically early, especially for
+         plosive endings — we need to search well past their reported end)
+      2. Measure RMS at 5ms granularity (was 10ms in v0.12 — too coarse)
+      3. Find all "peaks" = chunks with RMS > floor + 6dB (real speech)
+      4. Walk backward through peaks, find the LAST one followed by
+         sustained silence (≥30ms below floor without speech recovery)
+      5. Cut 20ms after that peak (decay tail grace)
+      6. If no peak has sustained silence after it, speech extends through
+         the entire window — cut at window_end - 5ms (best effort)
 
     Args:
         input_path: audio file
@@ -1124,29 +1137,23 @@ def find_gap_quietest(
         next_start: start timestamp of next scene (from ElevenLabs)
         audio_duration: total audio duration (for clamping)
         global_speech_floor_db: threshold below which is silence (e.g. -33 dB)
-        buffer_ms: legacy param, kept for backward compat (not used in v0.12)
-        chunk_ms: RMS measurement granularity (default 10ms)
-        back_buffer_ms: extend search before prev_end (default 10ms)
-        forward_buffer_ms: extend search past next_start (default 30ms)
-        edge_skip_ms: skip first/last Nms of gap to avoid edge artifacts
+        buffer_ms: legacy param, kept for backward compat
+        chunk_ms: RMS measurement granularity (default 5ms — fine for plosives)
+        back_buffer_ms: extend search before prev_end (default 30ms)
+        forward_buffer_ms: extend search past next_start (default 200ms)
+        min_silence_after_peak_ms: minimum sustained silence to confirm
+            a peak is the actual word-end (default 30ms)
+        decay_tail_ms: grace period after detected word-end (default 20ms)
+        peak_threshold_offset_db: how much above floor counts as "peak"
+            (default +6dB — distinguishes real speech from grenzwertig RMS)
 
     Returns:
-        dict with:
-          - cut_point: chosen timestamp
-          - cut_rms_db: RMS energy at cut point
-          - gap_ms: original gap between ElevenLabs timestamps
-          - window_start, window_end: search range
-          - chunks_measured: number of RMS samples
-          - moved_from_midpoint_ms: distance from naive gap midpoint
-          - cut_reason: why this cut was chosen (debug)
-          - prev_silence_start: where prev word's energy fell below floor
-          - next_silence_end: where next word's energy rose above floor
-          - global_speech_floor_db: the threshold used
+        dict with cut_point, cut_rms_db, gap_ms, window_start, window_end,
+        chunks_measured, moved_from_midpoint_ms, cut_reason, peak_position,
+        sustained_silence_after_ms, global_speech_floor_db
     """
-    # Conservative window: just the gap + small buffer on each side
     back_s = back_buffer_ms / 1000
     fwd_s = forward_buffer_ms / 1000
-    edge_s = edge_skip_ms / 1000
 
     window_start = max(0, prev_end - back_s)
     window_end = min(audio_duration, next_start + fwd_s)
@@ -1154,8 +1161,10 @@ def find_gap_quietest(
     gap_ms = round((next_start - prev_end) * 1000)
     gap_midpoint = (prev_end + next_start) / 2
 
+    peak_threshold_db = global_speech_floor_db + peak_threshold_offset_db
+
     # ============================================
-    # FALLBACK 1: Window too small to analyze
+    # FALLBACK 1: Window too small
     # ============================================
     if window_end - window_start < 0.020:
         return {
@@ -1166,43 +1175,21 @@ def find_gap_quietest(
             "window_end": round(window_end, 3),
             "chunks_measured": 0,
             "moved_from_midpoint_ms": 0,
-            "cut_reason": "window_too_small_midpoint_fallback",
-            "prev_silence_start": None,
-            "next_silence_end": None,
+            "cut_reason": "window_too_small_midpoint",
+            "peak_position": None,
+            "sustained_silence_after_ms": None,
             "global_speech_floor_db": round(global_speech_floor_db, 2),
+            "peak_threshold_db": round(peak_threshold_db, 2),
         }
 
-    # ============================================
-    # FALLBACK 2: Very short gap (<30ms)
-    # No real silence possible — use midpoint
-    # (v0.12.1: midpoint is safer than hard next_start cut)
-    # ============================================
-    if gap_ms < 30:
-        cut_point = gap_midpoint
-        return {
-            "cut_point": round(cut_point, 3),
-            "cut_rms_db": None,
-            "gap_ms": gap_ms,
-            "window_start": round(window_start, 3),
-            "window_end": round(window_end, 3),
-            "chunks_measured": 0,
-            "moved_from_midpoint_ms": 0,
-            "cut_reason": "very_short_gap_midpoint",
-            "prev_silence_start": None,
-            "next_silence_end": None,
-            "global_speech_floor_db": round(global_speech_floor_db, 2),
-        }
-
-    # Measure RMS in the conservative window
+    # Measure RMS at fine granularity
     windows = analyze_rms_windows(
         input_path, window_start, window_end, window_ms=chunk_ms
     )
 
     if not windows:
-        # Couldn't measure — fallback to midpoint (safer than next_start hard cut)
-        cut_point = gap_midpoint
         return {
-            "cut_point": round(cut_point, 3),
+            "cut_point": round(gap_midpoint, 3),
             "cut_rms_db": None,
             "gap_ms": gap_ms,
             "window_start": round(window_start, 3),
@@ -1210,83 +1197,92 @@ def find_gap_quietest(
             "chunks_measured": 0,
             "moved_from_midpoint_ms": 0,
             "cut_reason": "no_rms_data_midpoint",
-            "prev_silence_start": None,
-            "next_silence_end": None,
+            "peak_position": None,
+            "sustained_silence_after_ms": None,
             "global_speech_floor_db": round(global_speech_floor_db, 2),
+            "peak_threshold_db": round(peak_threshold_db, 2),
         }
 
     chunk_s = chunk_ms / 1000
 
     # ============================================
-    # WALK FORWARD: find where prev word's energy drops below floor
-    # Skip first edge_skip_ms past prev_end (definitely still speech/decay)
+    # PEAK DETECTION
+    # Find all chunks above peak threshold (= real speech, not grenzwertig)
     # ============================================
-    prev_silence_start = None  # time where prev word ends
-    forward_skip_until = prev_end + edge_s
+    peak_indices = [
+        i for i, (t, rms) in enumerate(windows)
+        if rms > peak_threshold_db
+    ]
 
-    for t, rms in windows:
-        if t < forward_skip_until:
-            continue
-        if rms < global_speech_floor_db:
-            prev_silence_start = t
-            break
+    if not peak_indices:
+        # No clear speech in window → use midpoint
+        cut_point = gap_midpoint
+        return {
+            "cut_point": round(cut_point, 3),
+            "cut_rms_db": None,
+            "gap_ms": gap_ms,
+            "window_start": round(window_start, 3),
+            "window_end": round(window_end, 3),
+            "chunks_measured": len(windows),
+            "moved_from_midpoint_ms": 0,
+            "cut_reason": "no_peaks_midpoint",
+            "peak_position": None,
+            "sustained_silence_after_ms": None,
+            "global_speech_floor_db": round(global_speech_floor_db, 2),
+            "peak_threshold_db": round(peak_threshold_db, 2),
+        }
 
     # ============================================
-    # WALK BACKWARD: find where next word's energy rises above floor
-    # Skip last edge_skip_ms before next_start (might be next word's onset)
+    # WALK BACKWARD through peaks
+    # Find LAST peak with sustained silence (≥30ms below floor) after it.
+    # This filters out mid-word RMS-dips (which are followed by more speech).
     # ============================================
-    next_silence_end = None  # time where next word starts
-    backward_skip_from = next_start - edge_s
+    min_silence_chunks = max(1, min_silence_after_peak_ms // chunk_ms)
+    last_real_peak_idx = None
+    sustained_silence_after = 0
 
-    for t, rms in reversed(windows):
-        if t > backward_skip_from:
-            continue
-        if rms < global_speech_floor_db:
-            # This chunk is silence — next word starts AFTER this chunk
-            next_silence_end = t + chunk_s
+    for peak_idx in reversed(peak_indices):
+        # Count consecutive silence chunks AFTER this peak
+        silence_run = 0
+        for j in range(peak_idx + 1, len(windows)):
+            t_j, rms_j = windows[j]
+            if rms_j < global_speech_floor_db:
+                silence_run += 1
+            else:
+                # Speech resumed — silence not sustained
+                break
+
+        if silence_run >= min_silence_chunks:
+            last_real_peak_idx = peak_idx
+            sustained_silence_after = silence_run * chunk_ms
             break
 
     # ============================================
     # DECIDE CUT POINT
     # ============================================
-    if prev_silence_start is not None and next_silence_end is not None:
-        if prev_silence_start < next_silence_end:
-            # Real silence found between words — cut in middle
-            cut_point = (prev_silence_start + next_silence_end) / 2
-            cut_reason = "silence_midpoint"
-        else:
-            # No real silence — words overlap acoustically (e.g. plosive
-            # decay extends into next word's onset).
-            # v0.12.1: cut AFTER prev word's burst, even if past next_start
-            # This preserves the full plosive (your "good" → "good" not "goo")
-            # at the cost of a small bite into the next word's onset.
-            cut_point = min(prev_silence_start + chunk_s, next_start + fwd_s)
-            cut_reason = "overlap_priorize_prev"
-    elif prev_silence_start is not None:
-        # Found end of prev word, but next word never went silent in window.
-        # v0.12.1: ALWAYS cut after the prev burst ends, even if that's past
-        # next_start. This preserves the full plosive decay tail.
-        # Bounded by window_end to prevent runaway cuts.
-        cut_point = min(prev_silence_start + chunk_s, window_end)
-        cut_reason = "after_prev_word"
-    elif next_silence_end is not None:
-        # Found start of next word's silence-before, but prev never went silent
-        # → prev word's tail extends past — cut at next_silence_end - 5ms
-        cut_point = max(prev_end, next_silence_end - edge_s)
-        cut_reason = "before_next_word"
+    if last_real_peak_idx is not None:
+        # Found a peak with sustained silence after it
+        peak_t, peak_rms = windows[last_real_peak_idx]
+        # Cut decay_tail_ms after the peak (captures plosive decay)
+        cut_point = peak_t + chunk_s + (decay_tail_ms / 1000)
+        # Clamp to window
+        cut_point = min(cut_point, window_end)
+        cut_reason = "after_last_real_peak"
     else:
-        # Neither silence detected — both words loud throughout window.
-        # v0.12.1: midpoint is statistically better than hard next_start - 5ms.
-        # Hard next_start cut consistently bleeds plosive tails into next scene.
-        cut_point = (prev_end + next_start) / 2
-        cut_reason = "no_silence_midpoint_fallback"
+        # No peak has sustained silence after → speech extends through window
+        # The next word's onset starts before any silence develops.
+        # Cut as late as possible to preserve current word's tail.
+        cut_point = max(prev_end, window_end - 0.005)
+        cut_reason = "no_sustained_silence_cut_late"
 
-    # Find the RMS at the chosen cut-point (for debug)
+    # Find RMS at cut point for debug
     cut_rms = None
     for t, rms in windows:
         if t <= cut_point < t + chunk_s:
             cut_rms = rms
             break
+
+    peak_t_debug = round(windows[last_real_peak_idx][0], 3) if last_real_peak_idx is not None else None
 
     return {
         "cut_point": round(cut_point, 3),
@@ -1297,12 +1293,11 @@ def find_gap_quietest(
         "chunks_measured": len(windows),
         "moved_from_midpoint_ms": round((cut_point - gap_midpoint) * 1000),
         "cut_reason": cut_reason,
-        "prev_silence_start": round(prev_silence_start, 3) if prev_silence_start else None,
-        "next_silence_end": round(next_silence_end, 3) if next_silence_end else None,
+        "peak_position": peak_t_debug,
+        "sustained_silence_after_ms": sustained_silence_after,
         "global_speech_floor_db": round(global_speech_floor_db, 2),
+        "peak_threshold_db": round(peak_threshold_db, 2),
     }
-
-
 @app.post("/audio/snap-scenes")
 async def snap_scenes_endpoint(
     file: UploadFile = File(...),
@@ -1315,53 +1310,50 @@ async def snap_scenes_endpoint(
     auth: str = Depends(verify_token)
 ):
     """
-    Snap scene boundaries to the actual silence between adjacent scenes.
+    Snap scene boundaries to actual word-ends using peak detection.
     
-    v0.12.0 GAP_QUIETEST MODE (default — global floor):
-      For each pair of adjacent scenes:
+    v0.13.0 PEAK DETECTION:
+      Don't look for "where does silence start" (the v0.12 mistake), look for
+      "where is the LAST peak with sustained silence after it". Words have
+      INTERNAL energy dips (e.g. between vowel and final stop in "good"),
+      and v0.12 was treating these as word-ends → cut mid-word.
+    
+    For each pair of adjacent scenes:
       1. Compute global speech_floor from full audio (mean_db - 15)
-      2. Search conservative window [prev_end - 10ms, next_start + 30ms]
-      3. Walk forward: find where prev word energy drops below floor
-      4. Walk backward: find where next word energy rises above floor
-      5. Cut in middle of detected silence span
-      6. If words overlap acoustically (e.g. plosive burst into next word):
-         cut at next_start - 5ms (priorize clean next word start)
+      2. Search wide window: prev_end - 30ms to next_start + 200ms
+      3. Find peaks (chunks with RMS > floor + 6dB) — real speech
+      4. Walk backward: find LAST peak followed by ≥30ms sustained silence
+      5. Cut 20ms after that peak (decay tail grace)
+      6. If no peak has sustained silence after → speech crosses window,
+         cut at window_end - 5ms (best effort)
     
-    Why v0.12.0 vs older versions:
-      - v0.11.0 used a per-window speech_floor that broke in short gaps
-        (computed from mostly-silence data, gave -50dB+ floors that made
-        algorithm think speech extended way past prev_end → cut 200-500ms
-        too late, bleeding next word into prev scene)
-      - v0.12.0 uses GLOBAL speech_floor from whole audio = stable threshold
-      - v0.12.0 uses CONSERVATIVE window (gap + small buffers) instead of
-        v0.11.0's aggressive 250ms forward search
-    
-    Trade-off: Plosive endings on very short gaps (<60ms) may have a
-    barely-audible 5-10ms tail-clip. This is acceptable because:
-    - Bleeding next word into prev scene is far worse hearing-wise
-    - When scenes are concatenated downstream, the tail still plays back
+    Why peak-detection vs "find first dip":
+      - "good" /gʊd/: dip between /ʊ/ and /d/, but /d/ is still coming
+        v0.12 cut at the dip → "go" + "od" leak
+        v0.13 ignores dip (no sustained silence after), waits for actual
+        word-end peak from /d/-burst, cuts 20ms after that
+      - Most words: clean energy then silence → both algorithms find same point
+      - Words with internal dips: ONLY v0.13 handles correctly
     
     Form params:
       file:             Combined audio file (MP3)
       scenes:           JSON array [{part, start, end}, ...]
       mode:             'gap_quietest' (DEFAULT) | 'rms_minimum' | 'silence'
-      buffer_ms:        Legacy param, not used in v0.12.0 gap_quietest mode
-      chunk_ms:         RMS measurement granularity (default 20ms; in
-                        gap_quietest mode internal default is 10ms)
+      buffer_ms:        Legacy param, not used in v0.13.0 gap_quietest
+      chunk_ms:         RMS measurement granularity (legacy; v0.13 uses 5ms internally)
       search_window_ms: Used in 'rms_minimum' and 'silence' modes only
       min_silence_ms:   Used in 'silence' mode only
     
     Returns:
-      - Adjusted scenes array (no gaps, no overlaps, cuts in real silence)
+      - Adjusted scenes array (no gaps, no overlaps)
       - Per-boundary cut_reason for debugging:
-        * "silence_midpoint" — clean silence found, cut in middle (BEST)
-        * "after_prev_word" — found prev burst end, cut after burst
-                              (preserves plosive even if past next_start)
-        * "before_next_word" — found start of next, cut just before
-        * "overlap_priorize_prev" — words overlap, kept full prev word
-        * "very_short_gap_midpoint" — gap <30ms, use midpoint
-        * "no_silence_midpoint_fallback" — both loud, midpoint fallback
-        * "no_rms_data_midpoint" — measurement failed, midpoint fallback
+        * "after_last_real_peak" — found word-end + sustained silence (BEST)
+        * "no_peaks_midpoint" — no clear speech detected
+        * "no_sustained_silence_cut_late" — speech extends through window
+        * "window_too_small_midpoint" — gap too small to analyze
+        * "no_rms_data_midpoint" — RMS measurement failed
+      - peak_position: where the last real peak was detected
+      - sustained_silence_after_ms: how much silence followed the peak
     """
     if mode not in ("gap_quietest", "rms_minimum", "silence"):
         raise HTTPException(400, "mode must be 'gap_quietest', 'rms_minimum', or 'silence'")
@@ -1481,8 +1473,8 @@ async def snap_scenes_endpoint(
                         "window": [prev_cut["window_start"], prev_cut["window_end"]],
                         "moved_from_midpoint_ms": prev_cut["moved_from_midpoint_ms"],
                         "cut_reason": prev_cut.get("cut_reason"),
-                        "prev_silence_start": prev_cut.get("prev_silence_start"),
-                        "next_silence_end": prev_cut.get("next_silence_end"),
+                        "peak_position": prev_cut.get("peak_position"),
+                        "sustained_silence_after_ms": prev_cut.get("sustained_silence_after_ms"),
                     }
                 
                 # End: last scene = audio duration, others use next cut point
@@ -1502,8 +1494,8 @@ async def snap_scenes_endpoint(
                         "window": [next_cut["window_start"], next_cut["window_end"]],
                         "moved_from_midpoint_ms": next_cut["moved_from_midpoint_ms"],
                         "cut_reason": next_cut.get("cut_reason"),
-                        "prev_silence_start": next_cut.get("prev_silence_start"),
-                        "next_silence_end": next_cut.get("next_silence_end"),
+                        "peak_position": next_cut.get("peak_position"),
+                        "sustained_silence_after_ms": next_cut.get("sustained_silence_after_ms"),
                     }
                 
                 # Sanity check
@@ -1547,7 +1539,7 @@ async def snap_scenes_endpoint(
             return {
                 "status": "ok",
                 "mode": "gap_quietest",
-                "algorithm_version": "v0.12.1_burst_aware",
+                "algorithm_version": "v0.13.0_peak_detection",
                 "audio_duration": round(audio_duration, 3),
                 "buffer_ms": buffer_ms,
                 "chunk_ms": chunk_ms,
@@ -1563,8 +1555,8 @@ async def snap_scenes_endpoint(
                         "gap_ms": cp["gap_ms"],
                         "window": [cp["window_start"], cp["window_end"]],
                         "cut_reason": cp.get("cut_reason"),
-                        "prev_silence_start": cp.get("prev_silence_start"),
-                        "next_silence_end": cp.get("next_silence_end"),
+                        "peak_position": cp.get("peak_position"),
+                        "sustained_silence_after_ms": cp.get("sustained_silence_after_ms"),
                     }
                     for i, cp in enumerate(cut_points)
                 ],
