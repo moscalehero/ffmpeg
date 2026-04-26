@@ -1,12 +1,12 @@
 """
-FFmpeg HTTP Service v0.12.0
+FFmpeg HTTP Service v0.12.1
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
-  POST /audio/snap-scenes   - Global-floor gap analysis (v0.12.0)
+  POST /audio/snap-scenes   - Burst-aware gap analysis (v0.12.1)
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, edge silence trim)
   POST /video/analyze       - Analyze video's audio track
@@ -15,6 +15,27 @@ Endpoints:
   POST /video/merge-audio   - Merge silent video with audio track (v0.9.6)
   POST /video/optimize      - Combined: smart-cut + auto-speedup + audio fade-in/out
   POST /video/preset        - Lightroom-style color grading (v0.9.12)
+
+Changelog v0.12.1:
+  - FIXED: "good" → "goo" plosive bug. The v0.12.0 logic for the
+    after_prev_word case incorrectly clamped the cut to next_start - 5ms,
+    even when the plosive burst extended past next_start. This caused
+    the d/t/p/b/k/g decay tail to be cut off and bleed into the next
+    scene's MP3.
+  - NEW LOGIC: When the algorithm detects the prev word's burst extends
+    past next_start (e.g. "good." + tight "Burning" = 60ms gap with
+    80ms d-burst), the cut is placed AFTER the burst ends. This keeps
+    the plosive intact at the cost of a small bite into the next word's
+    onset (typically 10-20ms, barely audible).
+  - CHANGED: Fallback cases (very_short_gap, no_rms_data, no_silence)
+    now use ElevenLabs midpoint instead of hard next_start - 5ms cut.
+    Hard next_start cuts consistently produced bleeding artifacts.
+  - New cut_reason values:
+    * "overlap_priorize_prev" — burst overlap detected, kept full prev word
+    * "after_prev_word" — burst extends past next_start, cut after burst
+    * "no_silence_midpoint_fallback" — no silence found, use midpoint
+    * "very_short_gap_midpoint" — gap <30ms, use midpoint
+    * "no_rms_data_midpoint" — measurement failed, use midpoint
 
 Changelog v0.12.0:
   - FIXED: snap-scenes was systematically cutting 200-500ms past prev_end,
@@ -25,24 +46,10 @@ Changelog v0.12.0:
   - NEW APPROACH (global_floor mode):
     * Speech floor computed ONCE from the whole audio (mean_db - 15)
     * Conservative search window: prev_end - 10ms to next_start + 30ms
-      (was 280ms wide in v0.11.0, now ~50-200ms)
     * Walk forward: find where prev word's energy drops below floor
     * Walk backward: find where next word's energy rises above floor
     * Cut in middle of detected silence
-    * If words overlap acoustically (plosive burst into next word):
-      cut at next_start - 5ms (priorize clean next word start)
-  - TRADE-OFF: Plosive endings on very short gaps (<60ms) may have a
-    barely-audible tail-clip (5-10ms of d/t/p decay). This is acceptable
-    because: (a) bleeding into next word is far worse for hearing, (b)
-    when scenes are concatenated downstream, the tail still plays back.
-  - Response includes new debug fields: cut_reason, prev_silence_start,
-    next_silence_end, global_speech_floor_db.
-
-Changelog v0.11.0 (FAILED — superseded by v0.12.0):
-  - Attempted post-speech detection with asymmetric 30ms back / 250ms
-    forward window. The forward buffer was way too aggressive: cut points
-    landed 200-500ms past prev_end on every scene, cutting deep into the
-    NEXT scene's audio. Reverted approach in v0.12.0.
+  - SUPERSEDED by v0.12.1 (burst-aware fixes)
 
 Changelog v0.10.1:
   - CHANGED: Trailing trim buffer 25ms → 50ms (symmetric with leading)
@@ -147,7 +154,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="0.12.0")
+app = FastAPI(title="FFmpeg Service", version="0.12.1")
 
 # ============================================
 # CONFIG
@@ -931,7 +938,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "0.12.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.12.1", "status": "running"}
 
 
 @app.get("/health")
@@ -1167,11 +1174,11 @@ def find_gap_quietest(
 
     # ============================================
     # FALLBACK 2: Very short gap (<30ms)
-    # No real silence possible — just cut at next_start - 5ms
-    # to priorize clean next word start (per user preference)
+    # No real silence possible — use midpoint
+    # (v0.12.1: midpoint is safer than hard next_start cut)
     # ============================================
     if gap_ms < 30:
-        cut_point = max(prev_end, next_start - edge_s)
+        cut_point = gap_midpoint
         return {
             "cut_point": round(cut_point, 3),
             "cut_rms_db": None,
@@ -1179,8 +1186,8 @@ def find_gap_quietest(
             "window_start": round(window_start, 3),
             "window_end": round(window_end, 3),
             "chunks_measured": 0,
-            "moved_from_midpoint_ms": round((cut_point - gap_midpoint) * 1000),
-            "cut_reason": "very_short_gap_priorize_next",
+            "moved_from_midpoint_ms": 0,
+            "cut_reason": "very_short_gap_midpoint",
             "prev_silence_start": None,
             "next_silence_end": None,
             "global_speech_floor_db": round(global_speech_floor_db, 2),
@@ -1192,8 +1199,8 @@ def find_gap_quietest(
     )
 
     if not windows:
-        # Couldn't measure — fallback to next_start - 5ms (priorize next word)
-        cut_point = max(prev_end, next_start - edge_s)
+        # Couldn't measure — fallback to midpoint (safer than next_start hard cut)
+        cut_point = gap_midpoint
         return {
             "cut_point": round(cut_point, 3),
             "cut_rms_db": None,
@@ -1201,8 +1208,8 @@ def find_gap_quietest(
             "window_start": round(window_start, 3),
             "window_end": round(window_end, 3),
             "chunks_measured": 0,
-            "moved_from_midpoint_ms": round((cut_point - gap_midpoint) * 1000),
-            "cut_reason": "no_rms_data_priorize_next",
+            "moved_from_midpoint_ms": 0,
+            "cut_reason": "no_rms_data_midpoint",
             "prev_silence_start": None,
             "next_silence_end": None,
             "global_speech_floor_db": round(global_speech_floor_db, 2),
@@ -1249,13 +1256,18 @@ def find_gap_quietest(
             cut_reason = "silence_midpoint"
         else:
             # No real silence — words overlap acoustically (e.g. plosive
-            # decay extends into next word's onset). Priorize next word.
-            cut_point = max(prev_end, next_start - edge_s)
-            cut_reason = "overlap_priorize_next"
+            # decay extends into next word's onset).
+            # v0.12.1: cut AFTER prev word's burst, even if past next_start
+            # This preserves the full plosive (your "good" → "good" not "goo")
+            # at the cost of a small bite into the next word's onset.
+            cut_point = min(prev_silence_start + chunk_s, next_start + fwd_s)
+            cut_reason = "overlap_priorize_prev"
     elif prev_silence_start is not None:
-        # Found end of prev, but next word hasn't started silence yet
-        # → cut just after prev word ends (with 10ms safety)
-        cut_point = min(next_start - edge_s, prev_silence_start + chunk_s)
+        # Found end of prev word, but next word never went silent in window.
+        # v0.12.1: ALWAYS cut after the prev burst ends, even if that's past
+        # next_start. This preserves the full plosive decay tail.
+        # Bounded by window_end to prevent runaway cuts.
+        cut_point = min(prev_silence_start + chunk_s, window_end)
         cut_reason = "after_prev_word"
     elif next_silence_end is not None:
         # Found start of next word's silence-before, but prev never went silent
@@ -1263,10 +1275,11 @@ def find_gap_quietest(
         cut_point = max(prev_end, next_silence_end - edge_s)
         cut_reason = "before_next_word"
     else:
-        # Neither silence detected — both words are loud throughout window
-        # Fallback: priorize next word per user preference
-        cut_point = max(prev_end, next_start - edge_s)
-        cut_reason = "no_silence_priorize_next"
+        # Neither silence detected — both words loud throughout window.
+        # v0.12.1: midpoint is statistically better than hard next_start - 5ms.
+        # Hard next_start cut consistently bleeds plosive tails into next scene.
+        cut_point = (prev_end + next_start) / 2
+        cut_reason = "no_silence_midpoint_fallback"
 
     # Find the RMS at the chosen cut-point (for debug)
     cut_rms = None
@@ -1342,11 +1355,13 @@ async def snap_scenes_endpoint(
       - Adjusted scenes array (no gaps, no overlaps, cuts in real silence)
       - Per-boundary cut_reason for debugging:
         * "silence_midpoint" — clean silence found, cut in middle (BEST)
-        * "after_prev_word" — found end of prev, cut just after
+        * "after_prev_word" — found prev burst end, cut after burst
+                              (preserves plosive even if past next_start)
         * "before_next_word" — found start of next, cut just before
-        * "overlap_priorize_next" — words overlap, priorize next start
-        * "very_short_gap_priorize_next" — gap <30ms, can't analyze
-        * "no_silence_priorize_next" — both loud throughout (rare)
+        * "overlap_priorize_prev" — words overlap, kept full prev word
+        * "very_short_gap_midpoint" — gap <30ms, use midpoint
+        * "no_silence_midpoint_fallback" — both loud, midpoint fallback
+        * "no_rms_data_midpoint" — measurement failed, midpoint fallback
     """
     if mode not in ("gap_quietest", "rms_minimum", "silence"):
         raise HTTPException(400, "mode must be 'gap_quietest', 'rms_minimum', or 'silence'")
@@ -1532,7 +1547,7 @@ async def snap_scenes_endpoint(
             return {
                 "status": "ok",
                 "mode": "gap_quietest",
-                "algorithm_version": "v0.12.0_global_floor",
+                "algorithm_version": "v0.12.1_burst_aware",
                 "audio_duration": round(audio_duration, 3),
                 "buffer_ms": buffer_ms,
                 "chunk_ms": chunk_ms,
