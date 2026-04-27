@@ -1,60 +1,20 @@
 """
-FFmpeg HTTP Service v1.1.0
+FFmpeg HTTP Service v0.9.14
 Smart audio cutting + context-aware optimization + video optimization for UGC ad pipeline.
 
 Endpoints:
   GET  /                    - Service info
   GET  /health              - Health check + ffmpeg version
   GET  /auth-test           - Auth verification
-  POST /audio/snap-scenes   - Narrow-window quietest-chunk cut detection (v1.1.0)
+  POST /audio/snap-scenes   - Gap-based quietest-point snap (v0.9.11)
   POST /audio/cut-scenes    - Cut multiple scenes from combined audio
   POST /audio/optimize      - Smart optimization (target 3s, hard cap 4s, edge silence trim)
   POST /video/analyze       - Analyze video's audio track
   POST /video/smart-cut     - Auto-trim leading/trailing silence from video
   POST /video/speedup       - Speed up video + audio with constant pitch
   POST /video/merge-audio   - Merge silent video with audio track (v0.9.6)
-  POST /video/optimize      - Combined: smart-cut + auto-speedup + audio fade-in/out
+  POST /video/optimize      - Combined: smart-cut + auto-speedup + end-padding + audio fade-out
   POST /video/preset        - Lightroom-style color grading (v0.9.12)
-
-Changelog v1.1.0:
-  - FIXED: v1.0 wide forward window (600ms) caught the [pause] silence
-    belonging to the NEXT scene's transition, not the current one.
-    ElevenLabs character timestamps are systematically 100-500ms early,
-    so the actual [pause] silence appears far past next_start. v1.0
-    happily found that silence and cut there → cuts landed 500ms past
-    the actual gap, slicing into the next scene.
-  - NEW: NARROW WINDOW algorithm. Search only [prev_end - 30ms,
-    next_start + 30ms]. Pick the quietest 10ms chunk. Cut there.
-  - With [pause] tags creating real silence in the gap (when ElevenLabs
-    honors them), the quietest chunk IS that silence.
-  - When ElevenLabs ignores a [pause] tag (rare), the quietest chunk is
-    the local minimum — not silence, but the best available cut point.
-    Better than slicing into the next scene by 500ms.
-  - New cut_reason values:
-    * "quietest_chunk_silence" — cut in actual silence (BEST)
-    * "quietest_chunk_speech"  — no silence in gap, cut at local minimum
-    * "window_too_small_midpoint" — degenerate gap
-    * "no_rms_data_midpoint" — RMS measurement failed
-  - Removed: silence_block_* debug fields (no longer applicable)
-  - New: is_silence boolean field per cut
-
-Changelog v1.0.0 (SUPERSEDED by v1.1.0):
-  - Silence-block detection with wide forward window. Worked great in
-    isolation but caught wrong-scene pauses due to ElevenLabs timestamp
-    drift. Replaced with narrow-window approach.
-
-Changelog v0.13.0 (SUPERSEDED):
-  - Peak detection. Failed because chunk_ms=20 was too coarse.
-
-Changelog v0.12.x (SUPERSEDED):
-  - Various silence-walk approaches that failed because the underlying
-    voiceover had no real silence between many scene pairs.
-
-UPSTREAM DEPENDENCY:
-  This service pairs with [pause] tag injection in the ElevenLabs TTS
-  request preparation (tts_prep_v2.1.js). The audio tags create real
-  200-1000ms silence between sentences in the generated voiceover, which
-  this snap-scenes algorithm then detects and cuts cleanly.
 
 Changelog v0.10.1:
   - CHANGED: Trailing trim buffer 25ms → 50ms (symmetric with leading)
@@ -68,6 +28,7 @@ Changelog v0.10.0:
   - REMOVED: /video/concat endpoint (replaced by external service for assembly)
   - Per-scene processing only — clean main.py
   - Removed: build_concat_filter_chain helper, ConcatRequest model
+
 
 Changelog v0.9.12:
   - NEW: /video/preset endpoint — Lightroom-style color grading
@@ -144,6 +105,7 @@ Changelog v0.7:
   - Style-scaled atempo caps: Fast 1.08, Normal 1.12, Slow 1.15
 """
 
+import asyncio
 import subprocess
 import os
 import json
@@ -159,7 +121,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(title="FFmpeg Service", version="1.1.0")
+app = FastAPI(title="FFmpeg Service", version="0.10.3")
 
 # ============================================
 # CONFIG
@@ -167,6 +129,39 @@ app = FastAPI(title="FFmpeg Service", version="1.1.0")
 API_TOKEN = os.getenv("API_TOKEN", "change-me")
 WORK_DIR = Path("/tmp/ffmpeg")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================
+# CONCURRENCY CONTROL (v0.10.3)
+# ============================================
+# Limits how many video processing requests can run in parallel.
+# Prevents OOM on 8GB RAM server when n8n sends many requests at once.
+# 
+# Configurable via env var MAX_CONCURRENT_VIDEO (default: 2)
+# - Set to 1 if server is unstable
+# - Set to 3-4 if server has more RAM (16GB+)
+#
+# Audio endpoints don't use this — they're lightweight.
+MAX_CONCURRENT_VIDEO = int(os.getenv("MAX_CONCURRENT_VIDEO", "2"))
+VIDEO_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_VIDEO)
+
+# Track current concurrent requests for monitoring
+_concurrent_requests = 0
+_concurrent_lock = asyncio.Lock()
+
+async def acquire_video_slot():
+    """Acquire a slot in the video processing semaphore."""
+    global _concurrent_requests
+    await VIDEO_SEMAPHORE.acquire()
+    async with _concurrent_lock:
+        _concurrent_requests += 1
+    return _concurrent_requests
+
+async def release_video_slot():
+    """Release a slot in the video processing semaphore."""
+    global _concurrent_requests
+    async with _concurrent_lock:
+        _concurrent_requests = max(0, _concurrent_requests - 1)
+    VIDEO_SEMAPHORE.release()
 
 # Optimization targets
 SOFT_TARGET = 3.0          # ideal duration
@@ -943,7 +938,7 @@ def cut_scene(
 # ============================================
 @app.get("/")
 def root():
-    return {"service": "ffmpeg", "version": "1.1.0", "status": "running"}
+    return {"service": "ffmpeg", "version": "0.10.3", "status": "running"}
 
 
 @app.get("/health")
@@ -955,7 +950,13 @@ def health():
             ffmpeg_v = r.stdout.split("\n")[0]
     except Exception as e:
         ffmpeg_v = f"ERROR: {e}"
-    return {"status": "ok", "ffmpeg": ffmpeg_v}
+    return {
+        "status": "ok",
+        "ffmpeg": ffmpeg_v,
+        "concurrent_requests": _concurrent_requests,
+        "max_concurrent": MAX_CONCURRENT_VIDEO,
+        "available_slots": MAX_CONCURRENT_VIDEO - _concurrent_requests,
+    }
 
 
 @app.get("/auth-test")
@@ -1099,62 +1100,45 @@ def find_gap_quietest(
     prev_end: float,
     next_start: float,
     audio_duration: float,
-    global_speech_floor_db: float,
-    buffer_ms: int = 100,           # legacy, ignored
-    chunk_ms: int = 10,
-    back_buffer_ms: int = 30,
-    forward_buffer_ms: int = 30,
+    buffer_ms: int = 100,
+    chunk_ms: int = 20
 ) -> dict:
     """
-    Find the cut point in the gap between two scenes (v1.1.0 — narrow window).
-
-    Searches in a NARROW window around the ElevenLabs gap and picks the
-    quietest 10ms chunk. With [pause] tags creating real silence, this
-    finds the silence reliably. Without pause tags, picks the local
-    minimum which is the best available cut point.
-
-    Why narrow window instead of wide:
-      v1.0 used a 600ms forward window which worked great when the gap
-      had real silence in it, but caught the [pause] silence that belonged
-      to the NEXT scene's transition (because ElevenLabs timestamps are
-      systematically early). Result: cut 500ms past the actual gap,
-      slicing into the next scene.
-      v1.1 stays close to the ElevenLabs gap (just 30ms padding each side)
-      so the cut never strays into the next scene's territory.
-
-    Algorithm:
-      1. Search window: [prev_end - 30ms, next_start + 30ms]
-      2. Measure RMS at 10ms granularity across that window
-      3. Find the quietest chunk
-      4. Cut at the midpoint of that chunk
-
+    Find the quietest point BETWEEN two scenes (gap-based snap).
+    
+    This is the most reliable snap method because:
+    - The window is defined by the GAP between ElevenLabs timestamps
+    - We add a buffer on each side to catch the real pause
+    - The single quietest point becomes the shared cut boundary
+    - Both scenes use the SAME point — no coordination needed
+    
     Args:
         input_path: audio file
         prev_end: end timestamp of previous scene (from ElevenLabs)
         next_start: start timestamp of next scene (from ElevenLabs)
         audio_duration: total audio duration (for clamping)
-        global_speech_floor_db: silence threshold (computed from full audio)
-        buffer_ms: legacy param, ignored
-        chunk_ms: RMS measurement granularity (default 10ms)
-        back_buffer_ms: search before prev_end (default 30ms)
-        forward_buffer_ms: search past next_start (default 30ms)
-
+        buffer_ms: extra margin on each side of the gap (default 100ms)
+        chunk_ms: RMS measurement granularity (default 20ms)
+    
     Returns:
-        dict with cut_point, cut_rms_db, gap_ms, window, chunks_measured,
-        moved_from_midpoint_ms, cut_reason, is_silence (bool: was cut in
-        actual silence below floor), global_speech_floor_db
+        dict with:
+          - cut_point: the chosen timestamp (single point used for both boundaries)
+          - cut_rms_db: RMS energy at that point
+          - gap_ms: original gap between ElevenLabs timestamps
+          - window_start, window_end: actual search range
+          - chunks_measured: number of RMS samples taken
+          - moved_from_midpoint_ms: how far cut_point is from simple gap midpoint
     """
-    back_s = back_buffer_ms / 1000
-    fwd_s = forward_buffer_ms / 1000
-
-    window_start = max(0, prev_end - back_s)
-    window_end = min(audio_duration, next_start + fwd_s)
-
+    # Calculate search window: gap + buffer on each side
+    buffer_s = buffer_ms / 1000
+    window_start = max(0, prev_end - buffer_s)
+    window_end = min(audio_duration, next_start + buffer_s)
+    
     gap_ms = round((next_start - prev_end) * 1000)
     gap_midpoint = (prev_end + next_start) / 2
-
-    # Window too small (very rare with 30ms buffers)
-    if window_end - window_start < 0.030:
+    
+    if window_end - window_start < 0.05:
+        # Window too small — fallback to gap midpoint
         return {
             "cut_point": round(gap_midpoint, 3),
             "cut_rms_db": None,
@@ -1163,16 +1147,14 @@ def find_gap_quietest(
             "window_end": round(window_end, 3),
             "chunks_measured": 0,
             "moved_from_midpoint_ms": 0,
-            "cut_reason": "window_too_small_midpoint",
-            "is_silence": False,
-            "global_speech_floor_db": round(global_speech_floor_db, 2),
+            "fallback_reason": "window_too_small",
         }
-
-    # Measure RMS in narrow window
+    
+    # Measure RMS in small chunks across the gap+buffer window
     windows = analyze_rms_windows(
         input_path, window_start, window_end, window_ms=chunk_ms
     )
-
+    
     if not windows:
         return {
             "cut_point": round(gap_midpoint, 3),
@@ -1182,35 +1164,22 @@ def find_gap_quietest(
             "window_end": round(window_end, 3),
             "chunks_measured": 0,
             "moved_from_midpoint_ms": 0,
-            "cut_reason": "no_rms_data_midpoint",
-            "is_silence": False,
-            "global_speech_floor_db": round(global_speech_floor_db, 2),
+            "fallback_reason": "no_rms_data",
         }
-
-    chunk_s = chunk_ms / 1000
-
-    # Find the quietest chunk in the window
+    
+    # Find the chunk with LOWEST RMS
     quietest = min(windows, key=lambda w: w[1])
-    quietest_t, quietest_rms = quietest
-
-    # Cut at the midpoint of the quietest chunk
-    cut_point = quietest_t + chunk_s / 2
-
-    # Did we land in actual silence (below floor)?
-    is_silence = quietest_rms < global_speech_floor_db
-    cut_reason = "quietest_chunk_silence" if is_silence else "quietest_chunk_speech"
-
+    cut_point = quietest[0] + (chunk_ms / 1000) / 2  # center of chunk
+    cut_rms = quietest[1]
+    
     return {
         "cut_point": round(cut_point, 3),
-        "cut_rms_db": round(quietest_rms, 2),
+        "cut_rms_db": round(cut_rms, 2),
         "gap_ms": gap_ms,
         "window_start": round(window_start, 3),
         "window_end": round(window_end, 3),
         "chunks_measured": len(windows),
-        "moved_from_midpoint_ms": round((cut_point - gap_midpoint) * 1000),
-        "cut_reason": cut_reason,
-        "is_silence": is_silence,
-        "global_speech_floor_db": round(global_speech_floor_db, 2),
+        "moved_from_midpoint_ms": round(abs(cut_point - gap_midpoint) * 1000),
     }
 
 
@@ -1226,45 +1195,38 @@ async def snap_scenes_endpoint(
     auth: str = Depends(verify_token)
 ):
     """
-    Snap scene boundaries to the quietest point in a NARROW gap window.
+    Snap scene boundaries to the quietest point between adjacent scenes.
     
-    v1.1.0 NARROW-WINDOW ALGORITHM:
-      Pairs with [pause] tag injection in TTS request. With real silence
-      in the gap (when ElevenLabs honors [pause] tags), the quietest 10ms
-      chunk in a narrow window IS that silence. When ElevenLabs ignores
-      a tag (rare), we still pick the local minimum as best-effort cut.
+    v0.9.11 GAP-BASED MODE (default):
+      For each pair of adjacent scenes, find the single quietest point
+      BETWEEN their ElevenLabs timestamps. Both scene boundaries (prev end
+      + next start) snap to this shared cut-point.
     
-    For each pair of adjacent scenes:
-      1. Compute global speech_floor from full audio (mean_db - 15)
-      2. Search NARROW window: [prev_end - 30ms, next_start + 30ms]
-      3. Measure RMS at 10ms granularity
-      4. Pick the quietest chunk
-      5. Cut at the midpoint of that chunk
-    
-    Why narrow (v1.1) vs wide (v1.0):
-      v1.0 used a 600ms forward window. ElevenLabs timestamps are
-      systematically 100-500ms early, so the actual [pause] silence often
-      appears far past next_start — but that silence belongs to the NEXT
-      scene's gap, not the current one. v1.0 caught those, cutting 500ms
-      into the next scene. v1.1 stays close to ElevenLabs' reported gap.
+    Benefits vs v0.9.10 (target-anchored RMS):
+      ✅ No overlap/coordination issues — both scenes use SAME point
+      ✅ Window is defined by actual gap → always searches in the right zone
+      ✅ Can't snap into wrong scene's audio
+      ✅ Naturally handles any gap size (10ms to 500ms)
     
     Form params:
       file:             Combined audio file (MP3)
       scenes:           JSON array [{part, start, end}, ...]
       mode:             'gap_quietest' (DEFAULT) | 'rms_minimum' | 'silence'
-      buffer_ms:        Legacy param, not used in v1.1
-      chunk_ms:         RMS granularity (default 20 → mapped to 10 internally)
-      search_window_ms: Used in 'rms_minimum' and 'silence' modes only
-      min_silence_ms:   Used in 'silence' mode only
+      buffer_ms:        Extra margin around each gap (default 100ms)
+      chunk_ms:         RMS measurement granularity (default 20ms)
+      search_window_ms: Used in 'rms_minimum' and 'silence' modes (default 300ms)
+      min_silence_ms:   Used in 'silence' mode only (default 150ms)
+    
+    Gap-based logic (mode=gap_quietest):
+      For each boundary between scene N and scene N+1:
+        1. window = [scene_N.end - buffer, scene_N+1.start + buffer]
+        2. Measure RMS in chunk_ms chunks across window
+        3. Find lowest-RMS chunk → that's the cut point
+        4. Set scene_N.end = scene_N+1.start = cut_point
     
     Returns:
-      - Adjusted scenes array (no gaps, no overlaps)
-      - Per-boundary cut_reason:
-        * "quietest_chunk_silence" — cut in actual silence (BEST)
-        * "quietest_chunk_speech"  — no silence in gap, cut at local min
-        * "window_too_small_midpoint" — gap too small to analyze
-        * "no_rms_data_midpoint" — RMS measurement failed
-      - is_silence: bool indicating whether cut landed below speech_floor
+      - Adjusted scenes array (no gaps, no overlaps, cuts in actual silence)
+      - Per-boundary snap details (cut_point, RMS value, gap size, etc.)
     """
     if mode not in ("gap_quietest", "rms_minimum", "silence"):
         raise HTTPException(400, "mode must be 'gap_quietest', 'rms_minimum', or 'silence'")
@@ -1293,21 +1255,11 @@ async def snap_scenes_endpoint(
         audio_duration = get_duration(input_path)
         window_s = search_window_ms / 1000
         
-        # ============================================
-        # v0.12.0: Compute GLOBAL speech floor from full audio
-        # This is the threshold below which we consider audio to be silence.
-        # Computed once for the whole file → stable reference for all gaps.
-        # ============================================
-        volume = detect_volume(input_path)
-        if volume["mean_db"] is not None:
-            global_speech_floor_db = volume["mean_db"] - 15.0
-        else:
-            global_speech_floor_db = SILENCE_FALLBACK_DB
-        
         # Pre-analyze silences only if mode requires it
         silences = []
         silence_threshold_db = None
         if mode == "silence":
+            volume = detect_volume(input_path)
             if volume["mean_db"] is not None:
                 silence_threshold_db = volume["mean_db"] - SILENCE_RELATIVE_DB
             else:
@@ -1325,19 +1277,21 @@ async def snap_scenes_endpoint(
         scenes_sorted = sorted(scenes_list, key=lambda s: float(s["start"]))
         
         # ============================================
-        # GAP-BASED MODE (v0.11.0 default — post-speech aware)
+        # GAP-BASED MODE (v0.9.11 default)
         # ============================================
         if mode == "gap_quietest":
             adjusted_scenes = []
             snap_metadata = []
             cut_points = []
             
-            # Step 1: For each pair of adjacent scenes, find shared cut point
+            # Step 1: For each pair of adjacent scenes, find the shared cut point
+            # cut_points[i] = the snap between scene i and scene i+1
             for i in range(len(scenes_sorted) - 1):
                 prev_end = float(scenes_sorted[i]["end"])
                 next_start = float(scenes_sorted[i + 1]["start"])
                 
-                # Safety: if ElevenLabs has overlapping timestamps, swap
+                # Safety: if ElevenLabs has overlapping timestamps (prev_end > next_start),
+                # swap the window to still cover the area
                 if prev_end > next_start:
                     search_start = next_start
                     search_end = prev_end
@@ -1345,18 +1299,13 @@ async def snap_scenes_endpoint(
                     search_start = prev_end
                     search_end = next_start
                 
-                # v1.0: 10ms chunks for silence-block detection
-                # (legacy default chunk_ms=20 from Form gets mapped to 10)
-                effective_chunk_ms = 10 if chunk_ms == 20 else chunk_ms
-                
                 result = find_gap_quietest(
                     input_path,
                     search_start,
                     search_end,
                     audio_duration,
-                    global_speech_floor_db=global_speech_floor_db,
                     buffer_ms=buffer_ms,
-                    chunk_ms=effective_chunk_ms,
+                    chunk_ms=chunk_ms,
                 )
                 cut_points.append(result)
             
@@ -1368,7 +1317,7 @@ async def snap_scenes_endpoint(
                 original_start = float(scene["start"])
                 original_end = float(scene["end"])
                 
-                # Start: first scene = 0, others use the previous cut point
+                # Start: first scene always 0, others use the previous cut point
                 if is_first:
                     new_start = 0.0
                     start_snap_info = {"snapped": False, "reason": "first_scene"}
@@ -1384,11 +1333,9 @@ async def snap_scenes_endpoint(
                         "gap_ms": prev_cut["gap_ms"],
                         "window": [prev_cut["window_start"], prev_cut["window_end"]],
                         "moved_from_midpoint_ms": prev_cut["moved_from_midpoint_ms"],
-                        "cut_reason": prev_cut.get("cut_reason"),
-                        "is_silence": prev_cut.get("is_silence"),
                     }
                 
-                # End: last scene = audio duration, others use next cut point
+                # End: last scene = audio duration (capped), others use the next cut point
                 if is_last:
                     new_end = min(original_end, audio_duration)
                     end_snap_info = {"snapped": False, "reason": "last_scene"}
@@ -1404,8 +1351,6 @@ async def snap_scenes_endpoint(
                         "gap_ms": next_cut["gap_ms"],
                         "window": [next_cut["window_start"], next_cut["window_end"]],
                         "moved_from_midpoint_ms": next_cut["moved_from_midpoint_ms"],
-                        "cut_reason": next_cut.get("cut_reason"),
-                        "is_silence": next_cut.get("is_silence"),
                     }
                 
                 # Sanity check
@@ -1431,7 +1376,16 @@ async def snap_scenes_endpoint(
                     "end_snap": end_snap_info,
                 })
             
-            # Count actual snap events
+            # In gap mode, every boundary is snapped (no coordination needed)
+            snapped_count = sum(
+                1 for m in snap_metadata
+                if m["start_snap"].get("snapped") or m["end_snap"].get("snapped")
+            ) * 2 - sum(
+                1 for m in snap_metadata
+                if m["start_snap"].get("reason") in ("first_scene", "sanity_check_failed")
+                or m["end_snap"].get("reason") in ("last_scene", "sanity_check_failed")
+            )
+            # Simpler: count actual snap events
             snapped_count = 0
             fallback_count = 0
             for m in snap_metadata:
@@ -1449,11 +1403,9 @@ async def snap_scenes_endpoint(
             return {
                 "status": "ok",
                 "mode": "gap_quietest",
-                "algorithm_version": "v1.1.0_narrow_quietest",
                 "audio_duration": round(audio_duration, 3),
                 "buffer_ms": buffer_ms,
                 "chunk_ms": chunk_ms,
-                "global_speech_floor_db": round(global_speech_floor_db, 2),
                 "snapped_count": snapped_count,
                 "fallback_count": fallback_count,
                 "total_boundaries": snapped_count + fallback_count,
@@ -1464,8 +1416,6 @@ async def snap_scenes_endpoint(
                         "cut_rms_db": cp["cut_rms_db"],
                         "gap_ms": cp["gap_ms"],
                         "window": [cp["window_start"], cp["window_end"]],
-                        "cut_reason": cp.get("cut_reason"),
-                        "is_silence": cp.get("is_silence"),
                     }
                     for i, cp in enumerate(cut_points)
                 ],
@@ -1475,7 +1425,7 @@ async def snap_scenes_endpoint(
             }
         
         # ============================================
-        # LEGACY MODES (rms_minimum, silence) — backward compat
+        # LEGACY MODES (rms_minimum, silence) — kept for backward compatibility
         # ============================================
         adjusted_scenes = []
         snap_metadata = []
@@ -2145,7 +2095,17 @@ async def video_analyze_endpoint(
     """
     Extract audio from video and run full analysis.
     Useful for understanding Seedance output before deciding trim/speedup.
+    
+    v0.10.3: Limited to MAX_CONCURRENT_VIDEO concurrent requests.
     """
+    await acquire_video_slot()
+    try:
+        return await _video_analyze_impl(file)
+    finally:
+        await release_video_slot()
+
+
+async def _video_analyze_impl(file):
     start_time = time.time()
     job_id = str(uuid.uuid4())[:8]
     video_path = WORK_DIR / f"{job_id}_input.mp4"
@@ -2187,8 +2147,16 @@ async def video_smart_cut_endpoint(
     Auto-trim leading and trailing silence from video.
     Preserves all mid-speech content and pauses.
     
-    Uses same silence detection as /audio/optimize edge trim.
+    v0.10.3: Limited to MAX_CONCURRENT_VIDEO concurrent requests.
     """
+    await acquire_video_slot()
+    try:
+        return await _video_smart_cut_impl(file, buffer_ms)
+    finally:
+        await release_video_slot()
+
+
+async def _video_smart_cut_impl(file, buffer_ms):
     start_time = time.time()
     job_id = str(uuid.uuid4())[:8]
     video_path = WORK_DIR / f"{job_id}_input.mp4"
@@ -2273,13 +2241,20 @@ async def video_speedup_endpoint(
 ):
     """
     Speed up video + audio with constant pitch.
-    Useful for tightening slow-paced Seedance output.
     
-    Speed range: 0.5 - 2.0 (recommended: 1.0 - 1.15 for UGC)
+    v0.10.3: Limited to MAX_CONCURRENT_VIDEO concurrent requests.
     """
     if speed < 0.5 or speed > 2.0:
         raise HTTPException(400, "speed must be between 0.5 and 2.0")
     
+    await acquire_video_slot()
+    try:
+        return await _video_speedup_impl(file, speed)
+    finally:
+        await release_video_slot()
+
+
+async def _video_speedup_impl(file, speed):
     start_time = time.time()
     job_id = str(uuid.uuid4())[:8]
     video_path = WORK_DIR / f"{job_id}_input.mp4"
@@ -2356,6 +2331,14 @@ async def video_merge_audio_endpoint(
     if not audio_url and not audio_file:
         raise HTTPException(400, "Must provide either audio_url or audio_file")
     
+    await acquire_video_slot()
+    try:
+        return await _video_merge_audio_impl(video, audio_url, audio_file)
+    finally:
+        await release_video_slot()
+
+
+async def _video_merge_audio_impl(video, audio_url, audio_file):
     start_time = time.time()
     job_id = str(uuid.uuid4())[:8]
     video_path = WORK_DIR / f"{job_id}_video_in.mp4"
@@ -2495,6 +2478,14 @@ async def video_optimize_endpoint(
     if max_speedup is not None:
         profile_settings["max_speedup"] = max_speedup
     
+    await acquire_video_slot()
+    try:
+        return await _video_optimize_impl(file, profile_settings, apply_trim, apply_speedup)
+    finally:
+        await release_video_slot()
+
+
+async def _video_optimize_impl(file, profile_settings, apply_trim, apply_speedup):
     start_time = time.time()
     job_id = str(uuid.uuid4())[:8]
     video_path = WORK_DIR / f"{job_id}_input.mp4"
@@ -2605,6 +2596,9 @@ async def video_optimize_endpoint(
             "applied": {
                 "trim_applied": actual_trim_applied,
                 "speedup_applied": round(actual_speedup, 3),
+                "audio_fade_applied": True,
+                "audio_fade_in_ms": 50,
+                "audio_fade_out_ms": 50,
             },
             "final_duration": round(final_duration, 3),
             "video_base64": video_b64,
@@ -2802,6 +2796,14 @@ async def video_preset_endpoint(
         "fade":       fade,
     }
     
+    await acquire_video_slot()
+    try:
+        return await _video_preset_impl(file, preset)
+    finally:
+        await release_video_slot()
+
+
+async def _video_preset_impl(file, preset):
     start_time = time.time()
     job_id = str(uuid.uuid4())[:8]
     video_path = WORK_DIR / f"{job_id}_input.mp4"
